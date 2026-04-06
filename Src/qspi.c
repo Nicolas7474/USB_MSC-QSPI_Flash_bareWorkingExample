@@ -1,14 +1,26 @@
-
+/*********************************************************/
+/*   Bare-Metal USB MSC + QSPI Flash MT25QL128
+ *
+ * Working example -  Main Functions: 			***/
+/*			*/
+/* readID, MT25Q_SubsectorErase, MT25Q_SubsectorRead, MT25Q_PageProgram, MT25Q_SubsectorWrite */
+/** 	***/
+/*	 Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()		*/
+/* 	 Nicolas Prata 2026								   ***/
+/*********************************************************/
 
 #include "qspi.h"
 #include "main.h"
 #include "stm32f4xx.h"
 #include "stm32f469xx.h"
+#include "timers.h"
 
 static inline void QSPI_Prepare_Indirect(void);
+static void QSPI_DMA_Global_Init(void);
+static void QSPI_AutoPollingMode(void);
+uint32_t ti = 0;
 
 void QSPI_Hardware_Init(void) {
-
 	/* Uses the pins PF6-PF10 and PB6 - respects the 180MHz clock tree from the USB drivers */
 
 	// 1. Enable GPIO Clocks (Port B and Port F)
@@ -46,10 +58,9 @@ void QSPI_Hardware_Init(void) {
 	GPIOF->AFR[0] &= ~((0xFU << (6 * 4)) | (0xFU << (7 * 4)));
 	GPIOF->AFR[0] |=  ((9U << (6 * 4)) | (9U << (7 * 4)));
 
-	// AFR[1] (Pins 8-15)
+	// AFR[1] (Pins 8-15) -  PS: The STM32 handles the NCS pin (PB6) automatically !
 	GPIOF->AFR[1] &= ~((0xFU << (0 * 4)) | (0xFU << (1 * 4)) | (0xFU << (2 * 4)));
 	GPIOF->AFR[1] |=  ((10U << (0 * 4)) | (10U << (1 * 4)) | (9U << (2 * 4)));
-	// PS: The STM32 handles the NCS pin (PB6) automatically !
 
 	// 3. Reset the QUADSPI memory controller to ensure a clean state
 	RCC->AHB3RSTR |=  RCC_AHB3RSTR_QSPIRST;
@@ -57,71 +68,62 @@ void QSPI_Hardware_Init(void) {
 
 	// 4. Peripheral Configuration (Device Configuration Register)
 	// FSIZE: Flash size is 128Mbits = 16MBytes -  Value in register is N where 2^(N+1) = bytes -> 2^(23+1) = 16MB
-	// with (N=log2​(Flash Size in Bytes)−1) = (log(Flash Size in Bytes)/log(2))-1
 	// CSHT: NCS (chip select) stays high for at least 2 cycles between flash memory commands
-	QUADSPI->DCR = (23U << QUADSPI_DCR_FSIZE_Pos) | (1U << QUADSPI_DCR_CSHT_Pos);
+	QUADSPI->DCR = (23U << QUADSPI_DCR_FSIZE_Pos) | (1U << QUADSPI_DCR_CSHT_Pos); // with N = (log(Flash Size in Bytes)/log(2))-1
 
-	// PRESCALER = 1 -> Clock = 180MHz / (3+1) = 45MHz
+	// PRESCALER = 1 -> Clock = 180MHz / (1+3) = 45MHz / Clock frequency 133 MHz (MAX) for all protocols in STR
 	// SSHIFT = 1    -> Sample on the half-cycle (Critical for 90MHz) - allows the data to be sampled later
-	// EN = 1        -> Enable peripheral
 	QUADSPI->CR = (3U << QUADSPI_CR_PRESCALER_Pos) | QUADSPI_CR_SSHIFT | QUADSPI_CR_EN; // CR Configuration
+
+	QSPI_DMA_Global_Init(); // Call to configure DMA
 }
 
 
-void QSPI_DMA_Global_Init(void) {
-    RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN; // Enable DMA2 Clock
-
+static void QSPI_DMA_Global_Init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN; 			 // Enable DMA2 Clock
     DMA2_Stream7->CR = (3U << DMA_SxCR_CHSEL_Pos)  | // QUADSPI is mapped to DMA2, Stream 7, Channel 3.
-                       (1U << DMA_SxCR_MBURST_Pos) | // Incremental burst of 4 beats (Memory)
-                       (1U << DMA_SxCR_PBURST_Pos) | // Incremental burst of 4 beats (Peripheral)
-                       (2U << DMA_SxCR_PL_Pos)     | // High Priority
-                       (2U << DMA_SxCR_MSIZE_Pos)  | // Memory size 32-bit (a complete word)
-                       (2U << DMA_SxCR_PSIZE_Pos)  | // Peripheral size 32-bit
+                       (0U << DMA_SxCR_MBURST_Pos) | // Incremental burst: single transfer (Memory)
+                       (0U << DMA_SxCR_PBURST_Pos) | // Incremental burst: single transfer (Peripheral)
+                       (1U << DMA_SxCR_PL_Pos)     | // Mid Priority
+                       (0U << DMA_SxCR_MSIZE_Pos)  | // Memory size 8-bit (a byte)
+                       (0U << DMA_SxCR_PSIZE_Pos)  | // Peripheral size 8-bit
                        DMA_SxCR_MINC               | // Increment RAM address
     				   DMA_SxCR_TCIE;                // Transfer Complete Interrupt Enable
 
-    DMA2_Stream7->FCR = DMA_SxFCR_DMDIS | (3U << DMA_SxFCR_FTH_Pos); // FIFO Full
+    DMA2_Stream7->FCR = DMA_SxFCR_DMDIS | (3U << DMA_SxFCR_FTH_Pos); // FIFO Direct mode disabled / FIFO threshold: Full
     DMA2_Stream7->PAR = (uint32_t)&QUADSPI->DR;  // Set Peripheral Address (QUADSPI DR)
 }
 
 
 void QSPI_Flash_Reset(void) {
-	// 1. Reset Enable Command (0x66)
-	while (QUADSPI->SR & QUADSPI_SR_BUSY);
-	// IMODE=1, Instruction=0x66, FMODE=0 (Write)
-	QUADSPI->CCR = (1U << QUADSPI_CCR_IMODE_Pos) | (0x66U << QUADSPI_CCR_INSTRUCTION_Pos);
-	while (!(QUADSPI->SR & QUADSPI_SR_TCF));
-	QUADSPI->FCR = QUADSPI_FCR_CTCF;
-
-	// 2. Reset Memory Command (0x99)
-	while (QUADSPI->SR & QUADSPI_SR_BUSY);
-	// IMODE=1, Instruction=0x99, FMODE=0 (Write)
-	QUADSPI->CCR = (1U << QUADSPI_CCR_IMODE_Pos) | (0x99U << QUADSPI_CCR_INSTRUCTION_Pos);
-	while (!(QUADSPI->SR & QUADSPI_SR_TCF));
-	QUADSPI->FCR = QUADSPI_FCR_CTCF;
-
-	// 3. Mandatory Delay
-	// The MT25QL needs time to perform the internal reset (tRST)
-	// A simple volatile loop for roughly 1-5ms
-	for(volatile int i = 0; i < 0x7FFF; i++);
+    // --- Step 1: Try resetting in Quad Mode (just in case it's stuck there) ---
+    QUADSPI->CCR = (3U << QUADSPI_CCR_IMODE_Pos) | (0x66U << QUADSPI_CCR_INSTRUCTION_Pos);
+    for (volatile uint32_t i = 0; i < 2000; i++) { __NOP(); }
+    QUADSPI->CCR = (3U << QUADSPI_CCR_IMODE_Pos) | (0x99U << QUADSPI_CCR_INSTRUCTION_Pos);
+    for (volatile uint32_t i = 0; i < 18000; i++) { __NOP(); }
+    // --- Step 2: Try resetting in 1-line Mode (Standard) ---
+    QUADSPI->CCR = (1U << QUADSPI_CCR_IMODE_Pos) | (0x66U << QUADSPI_CCR_INSTRUCTION_Pos);
+    while (QUADSPI->SR & QUADSPI_SR_BUSY);
+    QUADSPI->CCR = (1U << QUADSPI_CCR_IMODE_Pos) | (0x99U << QUADSPI_CCR_INSTRUCTION_Pos);
+    // Wait for the Flash to re-initialize internally
+    for (volatile uint32_t i = 0; i < 18000; i++) { __NOP(); } // at least 1ms
+    QUADSPI->FCR = 0x1F; // Clear all flags
 }
 
 void QSPI_Enable_MemoryMapped(void) {
-	// 1. Ensure any previous command is finished
-	while (QUADSPI->SR & QUADSPI_SR_BUSY);
+
+	QSPI_WaitUntilReady(); // Poll the Flash until status is no longer "write in progress"
 
 	// 2. Configure the communication parameters
-	// We use Opcode 0x0B (Fast Read) for 4-4-4 mode
-	// IMODE=3, ADMODE=3, DMODE=3, ADSIZE=2 (24-bit), DCYC=10, FMODE=3
 	QUADSPI->CCR = (3U  << QUADSPI_CCR_FMODE_Pos)  | // MEMORY MAPPED MODE
 			(10U << QUADSPI_CCR_DCYC_Pos)   | // 10 Dummy Cycles
 			(2U  << QUADSPI_CCR_ADSIZE_Pos) | // 24-bit address
 			(3U  << QUADSPI_CCR_DMODE_Pos)  | // Data 4 lines
 			(3U  << QUADSPI_CCR_ADMODE_Pos) | // Address 4 lines
 			(3U  << QUADSPI_CCR_IMODE_Pos)  | // Instruction 4 lines
-			(0x0BU << QUADSPI_CCR_INSTRUCTION_Pos);
-
-	// No need to wait for TCF here. The peripheral is now "transparent".
+			(0x6BU << QUADSPI_CCR_INSTRUCTION_Pos); // Opcode 0x6B (QUAD OUTPUT FAST READ)
+	/*   Once the QSPI is in Memory-Mapped mode, the QUADSPI->DR register is no longer used,
+		and you cannot send manual commands like readID() without first switching FMODE back to 0 or 1 */
 }
 
 static inline void QSPI_Prepare_Indirect(void) {
@@ -136,10 +138,8 @@ static inline void QSPI_Prepare_Indirect(void) {
 
 
 void QSPI_WriteEnable(void) {
-	while (QUADSPI->SR & QUADSPI_SR_BUSY); // Wait if busy
 
-	// Instruction Only: 0x06
-	// IMODE = 3 (Instruction on all lines), Instruction = 0x06 (MT25QL128 write enable)
+	// IMODE = 3 (Quad), Instruction = 0x06 (MT25QL128 write enable)
 	QUADSPI->CCR = (3U << QUADSPI_CCR_IMODE_Pos) | (0x06U << QUADSPI_CCR_INSTRUCTION_Pos); // All other phases (Address, Data, etc.) are 0
 
 	// Wait for the instruction to be sent (Transfer complete flag)
@@ -151,30 +151,29 @@ void QSPI_WriteEnable(void) {
 
 void QSPI_EnableQuadMode(void) {
 
-	QSPI_WriteEnable(); // send WREN first
-
+	/*First, write enable in 1-Wire mode */
+	while (QUADSPI->SR & QUADSPI_SR_BUSY);
+	QUADSPI->CCR = (1U << QUADSPI_CCR_IMODE_Pos) | (0x06U << QUADSPI_CCR_INSTRUCTION_Pos);
+	while (!(QUADSPI->SR & QUADSPI_SR_TCF)); // Wait for the instruction to be sent
+	QUADSPI->FCR = QUADSPI_FCR_CTCF;  // Clear Transfer Complete Flag
 	while (QUADSPI->SR & QUADSPI_SR_BUSY);
 
-	// We are sending 1 byte of data (data length register)
-	QUADSPI->DLR = 1 - 1;
+	QUADSPI->DLR = 1 - 1; 	// Sending 1 byte of data (data length register)
 
-	// Configure CCR for Indirect Write
-	QUADSPI->CCR = (0U << QUADSPI_CCR_FMODE_Pos) |			// FMODE = 0 (Indirect Write)
-			(1U << QUADSPI_CCR_DMODE_Pos) |  		// DMODE = 1 (Data on 1 line)
-			(1U << QUADSPI_CCR_IMODE_Pos) | 			// IMODE = 1 (Instruction on 1 line)
-			(0x61U << QUADSPI_CCR_INSTRUCTION_Pos);  // Instruction to be sent = 0x61 (Enhanced Volatile Configuration Register)
+	// Configure CCR
+	QUADSPI->CCR = (0U << QUADSPI_CCR_FMODE_Pos) |	 // FMODE = 0 (Indirect Write)
+			(1U << QUADSPI_CCR_DMODE_Pos) |  		 // DMODE = 1 (Data on 1 line)
+			(1U << QUADSPI_CCR_IMODE_Pos) | 		 // IMODE = 1 (Instruction on 1 line)
+			(0x61U << QUADSPI_CCR_INSTRUCTION_Pos);  // 0x61 = Enhanced Volatile Configuration Register
 
-	// write 0x7F (Quad I/O protocol enabled) to the MT25QL128 "Enhanced Volatile Configuration Register"
-	QUADSPI->DR = 0x7F;  // Send the value to the FIFO for "Full Quad Spi" (4-4-4) mode. This starts the transmission
+	// write 0x7F (Quad I/O Protocol Enable) to the MT25QL128 "Enhanced Volatile Configuration Register"
+	QUADSPI->DR = 0x7F;  // This starts the transmission
 
-	// Wait for completion
 	while (!(QUADSPI->SR & QUADSPI_SR_TCF)); // Wait for the PERIPHERAL to finish the SPI transaction
 	QUADSPI->FCR = QUADSPI_FCR_CTCF;
 
 	QSPI_WaitUntilReady(); // Wait for the FLASH CHIP to finish its internal write cycle
-
-	/*   Once the QSPI is in Memory-Mapped mode, the QUADSPI->DR register is no longer used,
-	and you cannot send manual commands like readID() without first switching FMODE back to 0 or 1.*/
+	/* Once the QSPI is configured in Quad mode, use value (3) in QUADSPI_CCR for DMODE, ADMODE and IMODE */
 }
 
 
@@ -182,9 +181,9 @@ uint8_t QSPI_GetStatus(void) {
 	while (QUADSPI->SR & QUADSPI_SR_BUSY);
 
 	QUADSPI->DLR = 1 - 1; // Expecting 1 byte
-	QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos) | // Functional mode: Indirect-READ mode
-			(3U << QUADSPI_CCR_DMODE_Pos) | // Data 4 line
-			(3U << QUADSPI_CCR_IMODE_Pos) | // Inst 4 line: send the Command on all 4 wires
+	QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos) | // Functional mode: Indirect-read mode
+			(3U << QUADSPI_CCR_DMODE_Pos) | 	   // We are in Quad mode
+			(3U << QUADSPI_CCR_IMODE_Pos) |
 			(0x05U << QUADSPI_CCR_INSTRUCTION_Pos); // Read MT25QL128 Status Register (can be read continuously and at any time)
 
 	while (!(QUADSPI->SR & QUADSPI_SR_TCF));
@@ -195,6 +194,7 @@ uint8_t QSPI_GetStatus(void) {
 }
 
 void QSPI_WaitUntilReady(void) {
+	// for MT25Q_SubsectorErase() env. 30ms of polling (0x05)
 	// Bit 0 of Status Register is WIP (Write In Progress)
 	while (QSPI_GetStatus() & 0x01); // bit 1 = "Write in progress" of MT25QL128 "Read Status Register"
 }
@@ -205,9 +205,10 @@ uint32_t readID(void) {
 	QSPI_Prepare_Indirect();
 	uint32_t id = 0;
 	QUADSPI->DLR = 3 - 1; // Expecting 3 bytes
+	// Important: READ ID does not support Full Quand SPI Mode
 	QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos) |	// Functional mode: Indirect-READ mode
-			(3U << QUADSPI_CCR_DMODE_Pos) | // Data 3 line
-			(3U << QUADSPI_CCR_IMODE_Pos) | // Inst 3 line: send the Command on all 4 wires
+			(1U << QUADSPI_CCR_DMODE_Pos) | // Data 1 line
+			(1U << QUADSPI_CCR_IMODE_Pos) | // Inst 1 line: send the Command on 1 wire
 			(0x9E << QUADSPI_CCR_INSTRUCTION_Pos); // Read MT25QL128 Status Register (can be read continuously and at any time)
 
 	while (!(QUADSPI->SR & QUADSPI_SR_TCF));
@@ -218,7 +219,7 @@ uint32_t readID(void) {
 }
 
 
-void MT25Q_SubsectorRead_DMA(uint32_t address, uint32_t *rData) {
+void MT25Q_SubsectorRead(uint32_t address, uint8_t *rData) {
 
 	QSPI_Prepare_Indirect(); // If necessary, abort from Memory-Mapped mode and clear the FCR Flags
 	QSPI_WaitUntilReady(); // Polling the Flash until status is no longer "write in progress"
@@ -226,23 +227,28 @@ void MT25Q_SubsectorRead_DMA(uint32_t address, uint32_t *rData) {
 	// Set up DMA for Memory-to-Peripheral
 	DMA2_Stream7->CR &= ~DMA_SxCR_EN;            // Disable DMA
 	while(DMA2_Stream7->CR & DMA_SxCR_EN);       // Wait for hardware to release
+	DMA2->HIFCR = 0x0F800000; // Clear all flags
 	DMA2_Stream7->M0AR = (uint32_t)rData;        // Set the Rx buffer
-	DMA2_Stream7->NDTR = 1024;                   // (4096 bytes / 4) transfers
+	DMA2_Stream7->NDTR = 4096;                   // (4096 bytes / 4) transfers
+	// DIR = 00 (Peripheral-to-Memory), MINC = 1, CHSEL = 3
+	DMA2_Stream7->CR = (3U << DMA_SxCR_CHSEL_Pos) | DMA_SxCR_MINC;
+	DMA2_Stream7->FCR = 0; // Direct Mode
 	DMA2_Stream7->CR &= ~DMA_SxCR_DIR_Msk;       // Set DIR to 00 (Peripheral-to-Memory)
 	DMA2_Stream7->CR |= DMA_SxCR_EN;             // Enable DMA
 
 	QUADSPI->DLR = 4096 - 1; // data length register (read 4KB)
+	QUADSPI->FCR = 0x1F;
+
+	QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos) |	// Configure QSPI for Indirect Read // works with 1 line
+			(10U << QUADSPI_CCR_DCYC_Pos)  |  // Dummy bytes - must comply with the Datasheet
+			(2U << QUADSPI_CCR_ADSIZE_Pos) |
+			(3U << QUADSPI_CCR_DMODE_Pos)  | // must 3
+			(3U << QUADSPI_CCR_ADMODE_Pos) | // must 3
+			(3U << QUADSPI_CCR_IMODE_Pos)  | // must 3
+			(0x6BU << QUADSPI_CCR_INSTRUCTION_Pos); // FAST READ
+	// if you ever switch to Fast Read, you must add dummy cycles or the data will be shifted by 8 bits.
 
 	QUADSPI->CR |= QUADSPI_CR_DMAEN;   // Enable DMA mode in QSPI
-
-	QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos) |	// Configure QSPI for Indirect Read
-			(10U << QUADSPI_CCR_DCYC_Pos)  |  	 	// Dummy bytes
-			(2U << QUADSPI_CCR_ADSIZE_Pos) |
-			(3U << QUADSPI_CCR_DMODE_Pos)  |
-			(3U << QUADSPI_CCR_ADMODE_Pos) |
-			(3U << QUADSPI_CCR_IMODE_Pos)  |
-			(0x0BU << QUADSPI_CCR_INSTRUCTION_Pos); // Fast read
-
 	QUADSPI->AR = address;  // Trigger start
 
     while (!(DMA2->HISR & DMA_HISR_TCIF7)); // Wait for DMA to finish (or use an IRQ)
@@ -259,70 +265,117 @@ void MT25Q_SubsectorErase(uint32_t address) {
 
 	QSPI_Prepare_Indirect(); // If necessary, abort from Memory-Mapped mode and clear the FCR Flags
 	QSPI_WaitUntilReady(); // Polling the Flash until status is no longer "write in progress"
-
 	QSPI_WriteEnable();  // Write Enable (Required before every Erase/Program)
 
-    QUADSPI->CCR = (2U << QUADSPI_CCR_ADSIZE_Pos) |   // 4-4-4 mode: IMODE=3, ADMODE=3, ADSIZE=2
+	// 1. Clear everything to prevent leftover state
+	    QUADSPI->DLR = 0;   // No data phase
+	    QUADSPI->ABR = 0;   // Explicitly disable Alternate Bytes
+	    QUADSPI->FCR = 0x1F; // Clear all status flags
+
+    QUADSPI->CCR = (0U << QUADSPI_CCR_FMODE_Pos)  | // Indirect Write
+    			   (2U << QUADSPI_CCR_ADSIZE_Pos) |   // 4-4-4 mode: IMODE=3, ADMODE=3, ADSIZE=2
+				   (0U << QUADSPI_CCR_DMODE_Pos)  | // NO DATA
                    (3U << QUADSPI_CCR_ADMODE_Pos) |
                    (3U << QUADSPI_CCR_IMODE_Pos)  |
                    (0x20U << QUADSPI_CCR_INSTRUCTION_Pos);  // Send Subsector Erase (0x20)
 
     QUADSPI->AR = address; // Trigger start
 
-    QSPI_WaitUntilReady();   // Wait for the physical erase to finish (WIP bit in Status Register)
+	while (QUADSPI->SR & QUADSPI_SR_BUSY);
+
+	QSPI_AutoPollingMode(); // BLOCKING 30ms !! TO IMPROVE (addinterrupt/ or a queue logic ??)
 }
 
-void MT25Q_PageProgram(uint32_t address, uint32_t *data) {
+void MT25Q_PageProgram(uint32_t address, uint8_t *pData) {
 
+	/* DMA cannot be used with Quad-SPI page programming.Even if you try single-line DMA with Quad mode enabled,
+	the QSPI controller won’t generate the proper signals for the MT25QL flash — hence the reads of 0x0/0x1. */
 	QSPI_Prepare_Indirect(); // If necessary, abort from Memory-Mapped mode and clear the FCR Flags
-	QSPI_WaitUntilReady(); // Polling the Flash until status is no longer "write in progress"
+    QSPI_WaitUntilReady();
+    QSPI_WriteEnable();
 
-    QSPI_WriteEnable(); // Write Enable is MANDATORY before every program command
+    // 1. Configure the Data Length (256 bytes)
+    QUADSPI->DLR = 256 - 1;
 
-    // Set up DMA for Memory-to-Peripheral
-    DMA2_Stream7->CR &= ~DMA_SxCR_EN;            // Disable DMA
-    while(DMA2_Stream7->CR & DMA_SxCR_EN);       // Wait for hardware to release
-    DMA2_Stream7->M0AR = (uint32_t)data;         // Set the Tx buffer
-    DMA2_Stream7->NDTR = 64;                     // (256 bytes / 4) transfers
-    DMA2_Stream7->CR |= DMA_SxCR_DIR_0;          // Set DIR to 01 (Memory-to-Peripheral)
-    DMA2_Stream7->CR |= DMA_SxCR_EN;             // Enable DMA
+    // 2. Configure CCR for Indirect Write (FMODE = 00)
+    // Using 1-1-1 (Instruction-Address-Data all on 1 line)
+    QUADSPI->CCR = (0U << QUADSPI_CCR_FMODE_Pos)  |
+                   (2U << QUADSPI_CCR_ADSIZE_Pos) | // 24-bit address
+				   (3U << QUADSPI_CCR_IMODE_Pos)  | // Instruction on 1 line
+                   (3U << QUADSPI_CCR_ADMODE_Pos) | // Address on 1 line
+				   (3U << QUADSPI_CCR_DMODE_Pos)  | // Data on 1 line
+                   (0x32U << QUADSPI_CCR_INSTRUCTION_Pos);
 
-    // Configure QSPI
-    QUADSPI->DLR = 256 - 1; // length
-    QUADSPI->CR |= QUADSPI_CR_DMAEN; // Enable DMA
-    QUADSPI->CCR = (0U << QUADSPI_CCR_FMODE_Pos)  | // Indirect Write
-                   (2U << QUADSPI_CCR_ADSIZE_Pos) | // 24-bit
-                   (3U << QUADSPI_CCR_DMODE_Pos)  |
-                   (3U << QUADSPI_CCR_ADMODE_Pos) |
-                   (3U << QUADSPI_CCR_IMODE_Pos)  |
-                   (0x02U << QUADSPI_CCR_INSTRUCTION_Pos);// Command 0x02 (Page Program)
-
-    // Essentially, a command starts as soon as firmware gives the last information that is necessary for this command
+    // 3. Set the Address (This triggers the start of the communication)
     QUADSPI->AR = address;
 
-    // 4. Wait for DMA and Flash Busy
-    while (!(DMA2->HISR & DMA_HISR_TCIF7)); // DMA finishes 64 words (Page Program) - Stream 7 Transfer Complete Interrupt Flag
-    DMA2->HIFCR = DMA_HIFCR_CTCIF7; // Clear flag
+    uint32_t i = 0;
+    while (i < 256)
+       {
+           // Wait until FIFO has space
+           while (!(QUADSPI->SR & QUADSPI_SR_FTF));
+           //Use FIFO threshold flag (FTF) instead of TCF - fill FIFO continuously, wait only at the end for TCF
+           // Faster: → Write 4 bytes at once instead of 1
+           // Buffer is aligned and has a fixed-size multiple of 4 = no extra bytes -> all ok
+           *(volatile uint32_t*)&QUADSPI->DR = *(uint32_t*)&pData[i];
+           i += 4;
+           ti++;
+       }
 
-    while (QUADSPI->SR & QUADSPI_SR_BUSY);
-    QUADSPI->CR &= ~QUADSPI_CR_DMAEN; // Disable DMA
-    QUADSPI->FCR = QUADSPI_FCR_CTCF; // CTCF: Clear transfer complete flag
+    // 5. Wait for the Transfer to be physically complete on the pins
+    while (!(QUADSPI->SR & QUADSPI_SR_TCF));
 
-    QSPI_WaitUntilReady(); // The Flash needs time to physically program the bits (up to 0.4ms)
+    // Clear Transfer Complete Flag
+    QUADSPI->FCR = QUADSPI_FCR_CTCF;
+
+    // 6. Final Busy check
+  //  while (QUADSPI->SR & QUADSPI_SR_BUSY);
+
+    // Crucial: Wait for the Flash to actually finish burning the bits
+    QSPI_WaitUntilReady();
 }
 
-void MT25Q_SubsectorWrite(uint32_t address, uint32_t *data) {
+
+
+void MT25Q_SubsectorWrite(uint32_t address, uint8_t *data) {
 
 	for(int i=0; i < 16; i++) {
-		MT25Q_PageProgram(address, &data[i*64]); // 64 * 4 bytes = 256 bytes per page
+		MT25Q_PageProgram(address, &data[i*256]); //  256 bytes per page
 		address += 256;
 	}
 }
 
-/* If DMAEN = 1, a DMA transfer is initiated
-	when FTF is set. FTF is cleared by hardware as soon as the threshold condition is no longer
-	true (after enough data is transferred by the CPU or DMA).
 
-*/
+
+
+static void QSPI_AutoPollingMode(void) {
+	// Use Automatic Status-polling Mode only inside Erase functions (big process time)
+
+    // 1. Set the match value and mask
+    QUADSPI->PSMAR = 0x00; // We want the bit to be 0
+    QUADSPI->PSMKR = 0x01; // We only care about Bit 0 (WIP)
+
+    // 2. Set polling interval (how often the hardware checks)
+    // This value defines how many CLK cycles to wait between polls
+    QUADSPI->PIR = 0x4000; // T = 1/(QSPI clock /  QUADSPI->PIR)
+
+    // 3. Configure the Control Register (CR)
+    // PMM = 0 (Bit 23): Match is found if ANY polling read matches
+    // APMS = 1 (Bit 22): STOP polling as soon as a match is found (saves power/bus)
+    // SMIE = 1 (Bit 19): Interrupt Enable - trigger the IRQ when SMF is set
+    QUADSPI->CR |= QUADSPI_CR_APMS | QUADSPI_CR_SMIE;
+
+    // 3. Configure CCR for Auto-Polling
+    QUADSPI->CCR = (2U << QUADSPI_CCR_FMODE_Pos) | // 10: Automatic polling mode
+                   (3U << QUADSPI_CCR_DMODE_Pos) | // Quad Data
+                   (3U << QUADSPI_CCR_IMODE_Pos) | // Quad Instruction
+                   (0x05U << QUADSPI_CCR_INSTRUCTION_Pos);
+
+    // 4. Wait for SMF (Status Match Flag) or enable the interrupt
+    while (!(QUADSPI->SR & QUADSPI_SR_SMF));
+
+    // 5. Clear flag and move on
+    QUADSPI->FCR = QUADSPI_FCR_CSMF;
+}
 
 

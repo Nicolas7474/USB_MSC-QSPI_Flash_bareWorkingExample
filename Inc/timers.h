@@ -4,6 +4,7 @@
 #include <stm32f4xx.h>
 #include <stm32f469xx.h>
 
+void Delay_us_TIM7(uint16_t us);
 
 void SysTickDelayMs(int delay);
 

@@ -17,15 +17,12 @@
 
 uint8_t chk = 0;
 uint8_t asked = 0;
-uint32_t sect[1024];
-// Global variables to track the state
-uint32_t msc_lba_to_write;
-uint8_t msc_write_in_progress = 0;
+uint8_t sect[4096];
 
 /* RX buffers for Endpoint structure*/
 #define RX_BUFFER_EP0_SIZE 64U // 8 is normally enough but 64 costs almost nothing in RAM and can prevent the most common USB crashes
 #define STORAGE_SIZE (1024 * 32) // 32KB RAM Disk
-#define QSPI_BASE_ADDR 0x90000000
+#define QSPI_BASE_ADDR 0x90000000 // Memory-Mapped Flash
 
 // Stores incoming SCSI commands (31 bytes) and incoming data from PC (WRITE_10). A standard SCSI sector is 512 bytes
 #define RX_BUFFER_EP1_SIZE (1024 * 32) // -> 32KB (out of 384 KB of system RAM) improves the performance, Windows can send 16 sectors without interrupts.
@@ -78,8 +75,6 @@ uint8_t *Media_Get_LBA_Pointer(uint32_t lba, uint16_t block_count) {
 static volatile uint32_t device_state = DEVICE_STATE_DEFAULT; /* Device state */
 volatile MSC_State_t msc_state = MSC_STATE_IDLE; // msc_state is tracking where things are in the MSC "Command-Data-Status" loop
 
-uint32_t msc_tag = 0; // Save the tag from the CBW here
-
 volatile static USB_setup_req_data setup_pkt_data; /* Setup Packet var */
 
 EndPointStruct EndPoint[EP_COUNT];	/* All the Enpoints are included in this array */
@@ -87,6 +82,8 @@ EndPointStruct EndPoint[EP_COUNT];	/* All the Enpoints are included in this arra
 // Global variables to track the write progress
 uint32_t write_lba;
 uint16_t write_block_count;
+uint32_t msc_tag = 0; // Save the tag from the CBW here
+static uint32_t msc_bytes_remaining = 0;
 
 /****************************************************************
  * 		static functions' declarations
@@ -666,44 +663,72 @@ static void MSC_Handle_Read10(USB_MSC_CBW_t *cbw) {
 }
 
 static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
-	/*	When you receive the WRITE_10 command in your parser, you aren't ready to send a CSW yet.
-	You must first "prime" the OUT EP to catch the data the Host is about to dump on you.
-	Flow of control:
-	1) CBW Arrives: MSC_Handle_Write10 is called. It enables the OUT EP to receive 4096 bytes. 2) Data Arrives: USB_MSC_transferRXCallback_EP1 fires.
-	3) The Trap: In your CDC project, the RX callback probably automatically re-enabled the EP to "listen" again. Do not do this during an MSC Write.
-	You must wait until you have processed the data and sent the CSW (Bulk IN) before you re-enable the Bulk OUT EP for the next CBW. */
+    /* When you receive the WRITE_10 command in your parser, you aren't ready to send a CSW yet.
+    You must first "prime" the OUT EP to catch the data the Host is about to dump on you.
+    Flow of control:
+    1) CBW Arrives: MSC_Handle_Write10 is called. It enables the OUT EP to receive 4096 bytes.
+    2) Data Arrives: USB_MSC_transferRXCallback_EP1 fires.
+    3) The Trap: In your CDC project, the RX callback probably automatically re-enabled the EP to "listen" again. Do not do this during an MSC Write.
+    You must wait until you have processed the data and sent the CSW (Bulk IN) before you re-enable the Bulk OUT EP for the next CBW. */
 
-	uint32_t lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | cbw->CB[5]; // LBA	Logical Block Address (The "address" of the data on the disk
+    // 1. Calculate LBA and Number of Blocks from CDB (Big Endian)
+    write_lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | cbw->CB[5];
+    write_block_count = (cbw->CB[7] << 8) | cbw->CB[8];
 
-	// We cannot write directly to 0x90000000; we must catch the data in our SRAM buffer (sect) first.
-	msc_tag = cbw->dTag;
-	msc_state = MSC_STATE_DATA_OUT;
-	msc_lba_to_write = lba;  // Store this to use in the completion callback
-	msc_write_in_progress = 1;
+    // 2. Calculate TOTAL bytes the Host is going to send
+    // Since your ReadCapacity reported 4096, total = write_block_count * 4096
+    // We cannot write directly to 0x90000000; we must catch the data in our SRAM buffer (sect) first.
+    msc_bytes_remaining = (uint32_t)write_block_count * 4096;
+    msc_tag = cbw->dTag;
+    msc_state = MSC_STATE_DATA_OUT;
 
-	// Point USB hardware to your workspace RAM buffer
-	EndPoint[1].rxBuffer_ptr = (uint8_t*)sect;
-	EndPoint[1].rxCounter = 4096; // Expecting a full subsector
+    // 3. Prepare the first chunk (4096 bytes)
+    // We only trigger 4096 at a time to fit your 'sect' buffer
+    uint32_t chunk_size = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
 
-	// Trigger Hardware Receive, then USB_MSC_WriteComplete_Callback() will be called upon reception of the data
-	USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | 4096; // 64 packets of 64 bytes
-	USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
+    // Point USB hardware to your workspace RAM buffer
+    EndPoint[1].rxBuffer_ptr = (uint8_t*)sect;
+    EndPoint[1].rxCounter = chunk_size;
+
+    // Trigger Hardware for the first 4096 bytes
+    // Trigger Hardware Receive, then USB_MSC_WriteComplete_Callback() will be called upon reception of the data
+    // (64 packets of 64 bytes)
+    USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | chunk_size;
+    USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
 }
 
-static void USB_MSC_WriteComplete_Callback(void) {
-	// Once the data have landed into the temporary buffer, we copy them to the Flash
-    uint32_t flash_addr = msc_lba_to_write * 4096;  // we use the saved LBA to calculate the physical address
-
+void USB_MSC_WriteComplete_Callback(void) {
     // 1. Physically burn to Flash
-    MT25Q_SubsectorErase(flash_addr);
-    MT25Q_SubsectorWrite(flash_addr, sect);
+    uint32_t flash_addr = write_lba * 4096;
 
+    MT25Q_SubsectorErase(flash_addr);
+    MT25Q_SubsectorWrite(flash_addr, (uint8_t*)sect);
+
+    // 2. Update tracking
+    msc_bytes_remaining -= 4096;
+    write_lba++; // Move to the next 4096-byte LBA
+
+    // 3. Check if the Host is still pushing more blocks (e.g., 16 blocks total)
+    if (msc_bytes_remaining > 0) {
+        // The Host has more data! We must re-arm the OUT EP to catch the next 4096 bytes.
+        // This prevents the NAK loop on the bus that causes the hang.
+        uint32_t next_chunk = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
+
+        EndPoint[1].rxBuffer_ptr = (uint8_t*)sect;
+        EndPoint[1].rxCounter = next_chunk;
+
+        USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | next_chunk;
+        USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
+
+        return; // Exit and wait for the next chunk to arrive
+    }
+
+    // 4. DATA PHASE FINISHED (msc_bytes_remaining == 0)
     // Re-enable Memory Mapping so the next 'Read' works!
     QSPI_Enable_MemoryMapped();
 
-    // Send the CSW (Status) to the PC
-    msc_write_in_progress = 0;
-	MSC_Send_CSW(msc_tag, 0, 0x00);
+    // Now send the CSW. The Host has finished sending all data and will finally send an IN token for the status.
+    MSC_Send_CSW(msc_tag, 0, 0x00);
 }
 
 static void MSC_Handle_ModeSense6(USB_MSC_CBW_t *cbw) {
@@ -1046,17 +1071,16 @@ uint32_t write_Fifo(uint8_t dfifo, uint8_t *src, uint16_t len) {
 * 			EndPoints' Callbacks
 ***************************************************/
 
-
-
 static uint32_t USB_MSC_transferTXCallback_EP1(void) {
 
 	uint32_t start_tick = GetSysTick();
 
 	// Ensure the hardware is physically ready for the next packet, preventing the "Incomplete" errors
-    while(USB_EP_IN(1)->DIEPCTL & USB_OTG_DIEPCTL_EPENA) {
+    while(USB_EP_IN(1)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)
+    {
     	// Do not use 'if' instead, it doesn't work. Measured (with DWT) 70ns delay at most among all phases
-		if (GetSysTick() - start_tick > 5) {
-			return EP_FAILED; // small 5ms timeout for less impact
+		if (GetSysTick() - start_tick > 1) {
+			return EP_FAILED; // small 1ms timeout
 		}
 	}
 
@@ -1082,7 +1106,16 @@ static uint32_t USB_MSC_transferTXCallback_EP1(void) {
 
         // If we have more than 128 bytes, enable the Empty FIFO interrupt
         if (chunk_size > 128) USB_OTG_DEVICE->DIEPEMPMSK |= (1 << 1);
+
+        if(asked == 1) {
+            	uint8_t po = 0;
+            	po = po +1 ; //TODO
+            	po = po + 2;
+            	//while(USB_EP_IN(1)->DIEPCTL & USB_OTG_DIEPCTL_EPENA);
+            }
     }
+
+
 
     return EP_OK;
 }
