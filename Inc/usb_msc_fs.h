@@ -14,8 +14,7 @@
 #include "stm32f469xx.h"
 
 /******************************************************************************
-* This section contains some macros and defines for better compatibility
-* with other libs. If you find any conflicting types, delete them from here
+* 										MACROS
 *******************************************************************************/
 
 #define USB_CLEAR_INTERRUPT(IRQ)    ((USB_OTG_FS->GINTSTS) &= (IRQ))
@@ -136,6 +135,12 @@ typedef struct __attribute__((packed)) {
 } USB_MSC_CSW_t;
 
 
+// return values of MSC_ functions
+typedef enum {
+    MSC_OK = 0,
+    MSC_FAIL = 1
+} MSC_Status_t;
+
 
 /***************************************************
  * 			SETUP stage request templates
@@ -221,9 +226,9 @@ void read_Fifo(uint8_t dfifo, uint16_t len);
 // uint32_t DTFXSTS_timeout(uint8_t Epnum, uint32_t dtxfsts_val); -> static
 
 /* Endpoint functions */
-uint32_t USB_MSC_setTxBuffer(uint8_t EPnum, uint8_t *txBuff, uint32_t len);
-uint32_t USB_MSC_transferTXCallback(uint8_t EPnum);
-uint32_t USB_MSC_transferRXCallback_EP1(uint32_t param);
+uint32_t MSC_setTxBuffer(uint8_t EPnum, uint8_t *txBuff, uint32_t len);
+uint32_t MSC_transferTXCallback(uint8_t EPnum);
+uint32_t MSC_transferRXCallback_EP1(uint32_t param);
 // inline void toggle_Rx_EP_Status(uint8_t EPnum, uint8_t param);
 
 /* misc */

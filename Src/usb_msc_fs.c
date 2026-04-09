@@ -19,7 +19,7 @@
 
 uint8_t chk = 0;
 uint8_t asked = 0;
-uint8_t sect[4096];
+uint8_t write_buf[4096];
 volatile uint8_t flag_fatfs_busy = 0;
 volatile uint8_t flag_usb_connected;
 
@@ -31,6 +31,11 @@ volatile uint8_t flag_usb_connected;
 // Stores incoming SCSI commands (31 bytes) and incoming data from PC (WRITE_10). A standard SCSI sector is 512 bytes
 #define RX_BUFFER_EP1_SIZE (1024 * 32) // -> 32KB (out of 384 KB of system RAM) improves the performance, Windows can send 16 sectors without interrupts.
 static uint8_t rxBufferEp0[RX_BUFFER_EP0_SIZE]; /* Received data is stored here after application reads DFIFO. RX FIFO is shared */
+
+#define CHUNK_SIZE 32768  // 32KB
+uint8_t msc_buffer_0[CHUNK_SIZE] __attribute__((aligned(4)));
+uint8_t msc_buffer_1[CHUNK_SIZE] __attribute__((aligned(4)));
+uint8_t active_buf = 0; // 0 or 1
 
 
 /* Even though the structs are "packed" for the protocol, the starting address of your buffers (like rxBufferEp1) should be 4-byte aligned (word-aligned).
@@ -64,15 +69,15 @@ uint8_t msc_sense_key = 0;
 uint8_t msc_asc = 0;
 uint8_t msc_ascq = 0;
 
-uint8_t *Media_Get_LBA_Pointer(uint32_t lba, uint16_t block_count);
-uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count);
-
-
-uint8_t *Media_Get_LBA_Pointer(uint32_t lba, uint16_t block_count) {
-    uint32_t offset = lba * 512;
-    // For reads, we point directly to the Flash silicon // block_count no longer used
-    return (uint8_t *)(QSPI_BASE_ADDR + offset);
-}
+//uint8_t *Media_Get_LBA_Pointer(uint32_t lba, uint16_t block_count);
+//uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count);
+//
+//
+//uint8_t *Media_Get_LBA_Pointer(uint32_t lba, uint16_t block_count) {
+//    uint32_t offset = lba * 512;
+//    // For reads, we point directly to the Flash silicon // block_count no longer used
+//    return (uint8_t *)(QSPI_BASE_ADDR + offset);
+//}
 
 /****************************************************************************/
 
@@ -109,20 +114,20 @@ static void SysTick_init(void);
 static void Get_ID_To_String(uint8_t *dest); // Get STM32 serial number (UID)
 
 // MSC static functions
-static void MSC_Parse_SCSI_Command(USB_MSC_CBW_t *cbw);
+static MSC_Status_t MSC_Parse_SCSI_Command(USB_MSC_CBW_t *cbw);
 static void MSC_Handle_Inquiry(USB_MSC_CBW_t *cbw);
 static void MSC_Send_CSW(uint32_t tag, uint32_t residue, uint8_t status);
 static void MSC_Handle_TestUnitReady(USB_MSC_CBW_t *cbw);
 static void MSC_Handle_ReadCapacity10(USB_MSC_CBW_t *cbw);
-static void MSC_Handle_Read10(USB_MSC_CBW_t *cbw);
-static void MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32_t len);
-static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw);
-static void USB_MSC_WriteComplete_Callback(void);
+static MSC_Status_t MSC_Handle_Read10(USB_MSC_CBW_t *cbw);
+static MSC_Status_t MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32_t len);
+static MSC_Status_t MSC_Handle_Write10(USB_MSC_CBW_t *cbw);
+static MSC_Status_t MSC_WriteComplete_Callback(void);
 static uint8_t MSC_is_blank(uint32_t flash_addr, uint32_t size);
 static void MSC_Handle_ModeSense6(USB_MSC_CBW_t *cbw);
-static void USB_MSC_Stall_Endpoints(void);
-static uint32_t USB_MSC_transferTXCallback_EP0(void);
-static uint32_t USB_MSC_transferTXCallback_EP1(void);
+static void MSC_Stall_Endpoints(void);
+static uint32_t MSC_transferTXCallback_EP0(void);
+static uint32_t MSC_transferTXCallback_EP1(void);
 static void MSC_Handle_RequestSense(USB_MSC_CBW_t *cbw);
 static void MSC_Handle_GetEventStatusNotification(USB_MSC_CBW_t *cbw);
 static void MSC_Handle_GetConfiguration(USB_MSC_CBW_t *cbw);
@@ -130,9 +135,7 @@ static void MSC_Handle_ReadTOC(USB_MSC_CBW_t *cbw);
 static void MSC_Handle_ReadDiscInfo(USB_MSC_CBW_t *cbw);
 static void MSC_Update_Sense_Data(uint8_t key, uint8_t asc, uint8_t ascq);
 static void MSC_Handle_ReadFormatCapacity(USB_MSC_CBW_t *cbw);
-static void USB_MSC_ForceResetState(void);
-uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count);
-
+static void MSC_ForceResetState(void);
 
 /**********************************************************************
  * GetSysTick() is required for Timeout detection in several functions
@@ -298,17 +301,17 @@ static void init_EndPoints(){
 	        EndPoint[i].rxCounter    = 0;
 	        EndPoint[i].txCounter    = 0;
 	        // Point to your generic or new MSC-specific handlers
-	        EndPoint[i].setTxBuffer  = &USB_MSC_setTxBuffer;
+	        EndPoint[i].setTxBuffer  = &MSC_setTxBuffer;
 	    }
 
 	    /* --- EP0: Control --- */
 	    EndPoint[0].rxBuffer_ptr = rxBufferEp0;
-	    EndPoint[0].txCallBack   = &USB_MSC_transferTXCallback_EP0;
+	    EndPoint[0].txCallBack   = &MSC_transferTXCallback_EP0;
 
 	    /* --- EP1: MSC Bulk Data --- */
 	    EndPoint[1].rxBuffer_ptr = rxBufferEp1; // Ensure this is 64-byte aligned
-	    EndPoint[1].rxCallBack   = &USB_MSC_transferRXCallback_EP1; // Your BOT State Machine starts here
-	    EndPoint[1].txCallBack   = &USB_MSC_transferTXCallback_EP1;
+	    EndPoint[1].rxCallBack   = &MSC_transferRXCallback_EP1; // Your BOT State Machine starts here
+	    EndPoint[1].txCallBack   = &MSC_transferTXCallback_EP1;
 
 	    /* Hardware: Setup EP0 to receive the first SETUP packet */
 	    // 3 Packets allowed (STUPCNT=3), 1 Packet count for data, 64 bytes size
@@ -382,19 +385,20 @@ void maintenance_switch(void) {
 		flag_usb_connected = 1; // Block the STM32 from starting any new writes
 		while (flag_fatfs_busy); // The "Atomic" Handover Logic: Wait for any existing write to finish ("Busy" flag check)
 
-        // --- GOING TO USB MODE ---
-        QSPI_WaitUntilReady();  // Wait for physical Flash to finish any background Erase/Write
-        //NBdelay_ms(10); //  Safety Delay, give the CPU a moment to clear any pending background tasks
-        USB_OTG_DEVICE->DCTL &= ~USB_OTG_DCTL_SDIS;  // Enable USB (Clear SDIS)
-        // UART_Send("USB Attached - FATfs Locked\r\n");
-    }
-    else {
-        // --- GOING TO FATfs MODE ---
-    	FRESULT res;
-    	USB_OTG_DEVICE->DCTL |= USB_OTG_DCTL_SDIS;   // Eject USB (Set SDIS)
+		// --- GOING TO USB MODE ---
+		QSPI_Prepare_Indirect(); // mandatory before checking (QUADSPI->SR & QUADSPI_SR_BUSY=
+		QSPI_WaitUntilReady();  // Wait for physical Flash to finish any background Erase/Write
+		QSPI_Enable_MemoryMapped(); // re-enable MMM for USB (cf. MSC_Handle_Read10 function)
+		USB_OTG_DEVICE->DCTL &= ~USB_OTG_DCTL_SDIS;  // Finally enable USB (Clear SDIS)
+	}
+	else {
+		// --- GOING TO FATfs MODE ---
+		FRESULT res;
+		USB_OTG_DEVICE->DCTL |= USB_OTG_DCTL_SDIS;   // Eject USB (Set SDIS)
         QSPI_WaitUntilReady(); // Wait for Flash Ready (the PC might have been writing right when the button was pressed)
-        NBdelay_ms(500);   // Safety Delay: Windows takes a moment to realize the device is gone.
+        QSPI_Enable_MemoryMapped();
         flag_usb_connected = 0; // Tell the STM32 logic it's safe to work again
+        NBdelay_ms(20);   // Safety Delay: Windows takes a moment to realize the device is gone
     	// Mount the drive - This doesn't "touch" the flash much; it just tells FatFs to initialize the fs structure and prepare for communication.
     	res = f_mount(&fs, "0:", 1); //  "": Defaut Drive (number 0) ; 1: Forced mount (checks for FAT structure immediately)
     	if (res != FR_OK) {	/* If res is FR_NO_FILESYSTEM*/ }
@@ -461,19 +465,19 @@ you must send the CSW with that exact same tag. If the tags don't match, Windows
 If a FIFO error occurs, the hardware sets a bit in DIEPINT, and we usually just STALL the endpoint. A software state bit isn't enough to recover.
  */
 
-uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count) { // pas utile ????
-    uint32_t offset = lba * 512;
+//uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count) { // pas utile ????
+//    uint32_t offset = lba * 512;
+//
+//    if (offset + (block_count * 512) <= STORAGE_SIZE) {
+//        // Just copy from USB buffer to our internal RAM "disk"
+//        //memcpy(&ram_disk[offset], buffer, block_count * 512);
+//        return 0; // Success
+//    }
+//    return 1; // Error
+//}
 
-    if (offset + (block_count * 512) <= STORAGE_SIZE) {
-        // Just copy from USB buffer to our internal RAM "disk"
-        //memcpy(&ram_disk[offset], buffer, block_count * 512);
-        return 0; // Success
-    }
-    return 1; // Error
-}
 
-
-static void MSC_Parse_SCSI_Command(USB_MSC_CBW_t *cbw) {
+static MSC_Status_t MSC_Parse_SCSI_Command(USB_MSC_CBW_t *cbw) {
 	uint8_t opcode = cbw->CB[0];
 
 	switch (opcode) {
@@ -547,7 +551,7 @@ static void MSC_Parse_SCSI_Command(USB_MSC_CBW_t *cbw) {
 		MSC_Send_CSW(cbw->dTag, residue, 0x01);
 		break;
 	}
-
+	return MSC_OK;
 	/* Handling REQUEST_SENSE (0x03):
 	If a command fails (status 0x01), the Host will immediately send a REQUEST_SENSE command to ask why it failed.
 	If you don't implement this, the OS might try to reset the entire USB bus.
@@ -608,11 +612,9 @@ static void MSC_Handle_ReadCapacity10(USB_MSC_CBW_t *cbw) {
 	   Since STM32 is Little Endian and USB/SCSI is Big Endian, you must manually swap the bytes. */
 
 	static uint8_t capacity[8];
-	// For 128Mbit (16MB) Flash:
-	// 16,777,216 bytes / 4096 bytes per block = 4096 blocks
-	uint32_t block_count = 4096;
-	uint32_t block_size = 4096;
-	uint32_t last_lba = block_count - 1; // 4095 (0x0FFF)
+	// For 128Mbit (16MB) Flash: 16,777,216 bytes / 4096 bytes per block = 4096 blocks
+	uint32_t block_size = MSC_BLOCK_SIZE;
+	uint32_t last_lba = MSC_TOTAL_BLOCKS - 1; // 4095 (0x0FFF)
 
 	// Last LBA (Big Endian): 0x00 00 0F FF
 	capacity[0] = (uint8_t)(last_lba >> 24);
@@ -633,119 +635,121 @@ static void MSC_Handle_ReadCapacity10(USB_MSC_CBW_t *cbw) {
 }
 
 
-static void MSC_Handle_Read10(USB_MSC_CBW_t *cbw) {
-	// READ_10 (0x28): sends the actual content of the disk - Memory-Mapped Mode, no DMA here !
+static MSC_Status_t MSC_Handle_Read10(USB_MSC_CBW_t *cbw) {
+	// READ_10 (0x28): sends the actual content of the disk - MEMORY-MAPPED MODE, no DMA here !
 
     // Extract LBA and Block Count from SCSI Command: you must parse the CBW to know which sector the PC wants
     uint32_t lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | cbw->CB[5];
     uint16_t block_count = (cbw->CB[7] << 8) | cbw->CB[8];
 
+    if ((lba + block_count) > MSC_TOTAL_BLOCKS) {
+        MSC_Update_Sense_Data(0x05, 0x21, 0x00); // Logical Block Address Out of Range
+        return MSC_FAIL;     // Out of bounds!
+    }
+
     // Calculate the source address and total length
-    uint32_t total_bytes = (uint32_t)block_count * 4096;
-    uint32_t flash_addr = 0x90000000 + (lba * 4096);  // Each LBA represents 4096 bytes
+    uint32_t total_bytes = (uint32_t)block_count * MSC_BLOCK_SIZE;
+    uint32_t flash_addr = 0x90000000 + (lba * MSC_BLOCK_SIZE);  // Each LBA represents 4096 bytes
 
     msc_tag = cbw->dTag; 	// Set the Global State
     msc_state = MSC_STATE_DATA_IN;
 
     // Kick the transfer - pass the Flash address as if it were a normal pointer
-    if (USB_MSC_setTxBuffer(1, (uint8_t*)flash_addr, total_bytes) != EP_OK) {
-        USB_MSC_Stall_Endpoints();
-        return; // If the endpoint was busy, we stall or handle error
+    if (MSC_setTxBuffer(1, (uint8_t*)flash_addr, total_bytes) != EP_OK) {
+        MSC_Stall_Endpoints();
+        return MSC_FAIL; // If the endpoint was busy, we stall or handle error
     }
-    	/* The USB_MSC_setTxBuffer will now:
+    return MSC_OK;
+    	/* The MSC_setTxBuffer will now:
     	 - Set the pointer to 0x90000000 + offset
      	 - Set the counter to 4096 (or more)
      	 - Call txCallBack() which fills the first packets from Flash
      	 - Enable DIEPEMPMSK to continue filling the FIFO as it empties */
 }
 
-static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
+static MSC_Status_t MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
     /* When you receive the WRITE_10 command in your parser, you must first "prime" the OUT EP to catch the
        data the Host is about to dump on you. Flow of control:
     1) CBW Arrives: MSC_Handle_Write10 is called. It enables the OUT EP to receive 4096 bytes.
-    2) Data Arrives: USB_MSC_transferRXCallback_EP1 fires.
-    3) The Trap: In your CDC project, the RX callback probably automatically re-enabled the EP to "listen" again. Do not do this during an MSC Write.
-    You must wait until you have processed the data and sent the CSW (Bulk IN) before you re-enable the Bulk OUT EP for the next CBW. */
+    2) Data Arrives: MSC_transferRXCallback_EP1 fires.
+    3) You must wait until you have processed the data and sent the CSW (Bulk IN) before you re-enable the Bulk OUT EP for the next CBW. */
 
     // 1. Calculate LBA and Number of Blocks from CDB (Big Endian)
     write_lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | cbw->CB[5]; // LBA
     write_block_count = (cbw->CB[7] << 8) | cbw->CB[8]; // length
 
+    if ((write_lba + write_block_count) > MSC_TOTAL_BLOCKS) {
+    	MSC_Update_Sense_Data(0x05, 0x21, 0x00); // Logical Block Address Out of Range
+    	return MSC_FAIL;     // Out of bounds!
+    }
+
     // 2. Calculate TOTAL bytes the Host is going to send
     // Since your ReadCapacity reported 4096, total = write_block_count * 4096
-    // We cannot write directly to 0x90000000; we must catch the data in our SRAM buffer (sect) first.
+    // We cannot write directly to 0x90000000; we must catch the data in our SRAM buffer (write_buf) first.
     msc_bytes_remaining = (uint32_t)write_block_count * 4096;
     msc_tag = cbw->dTag;
     msc_state = MSC_STATE_DATA_OUT;
     is_sector_pre_erased = 0; // Reset the optimization flag at the start of every new command
 
-    // 3. Prepare the first chunk - only trigger 4096 at a time to fit the 'sect' buffer
+    // 3. Prepare the first chunk - only trigger 4096 at a time to fit the 'write_buf' buffer
     uint32_t chunk_size = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
 
     // Point USB hardware to your workspace RAM buffer
-    EndPoint[1].rxBuffer_ptr = (uint8_t*)sect;
+    EndPoint[1].rxBuffer_ptr = (uint8_t*)write_buf;
     EndPoint[1].rxCounter = chunk_size;
 
-    // Trigger Hardware for the first 4096 bytes
-    // Trigger Hardware Receive, then USB_MSC_WriteComplete_Callback() will be called upon reception of the data
+    // Trigger Hardware Receive for the first 4096 bytes, then MSC_WriteComplete_Callback() will be called upon data reception
     // (64 packets of 64 bytes)
     USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | chunk_size;
     USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
+
+    return MSC_OK;
 }
 
-void USB_MSC_WriteComplete_Callback(void) {
-	// 1. Physically burn to Flash
+
+MSC_Status_t MSC_WriteComplete_Callback(void) {
+
 	uint32_t flash_addr = write_lba * 4096;
 
-	// If we haven't erased yet for this command...
-	if (is_sector_pre_erased == 0) {
-
-		// Only use bigger erases if:
-		// We are deep in the disk (past the boot/FAT area, e.g., LBA > 64) + it is perfectly aligned + the length is sufficient
-		// 32KB sector formating was found slightly faster than 64KB (and obviously 4KB) for transfers PC -> STM32
-		// to comply with 64KB sector formating: change to "write_lba % 16 == 0" and "(...4096 >= 65535))"
-		if (write_lba > 64 && (write_lba % 8 == 0) && (msc_bytes_remaining + 4096 >= 32768)) {
-			if (current_32k_block != (write_lba / 8)) {
-				// Perform Blank Check before Erasing
-				if (MSC_is_blank(flash_addr, 32768) == 0) {
-					GPIOD->ODR^=GPIO_ODR_OD5;
-					MT25Q_SubsectorErase_32KB(flash_addr);
-				}
-			}
-			current_32k_block = (write_lba / 8);
-			is_sector_pre_erased = 1;
-
-		} else {
-			// Standard safe mode for formatting/metadata
-			if (MSC_is_blank(flash_addr, 4096) == 0) {
-				GPIOD->ODR^=GPIO_ODR_OD4;
-				MT25Q_SubsectorErase_4KB(flash_addr);
-			}
-		}
+	/** ERASE LOGIC **/
+	if (write_lba <= 64) {
+	    // Sector-by-sector safety (slower) for FAT/Headers
+	    MT25Q_SubsectorErase_4KB(flash_addr);
 	}
+	else if (write_lba % 8 == 0) {
+	    // Start of a new 32KB chunk: Erase the whole thing once
+	    MT25Q_SubsectorErase_32KB(flash_addr); // 32KB block erase is faster than 4KB
+	    is_sector_pre_erased = 1; GPIOD->ODR^=GPIO_ODR_OD4;
+	}
+	else if (is_sector_pre_erased == 0) { GPIOD->ODR^=GPIO_ODR_OD5;
+	    // We are in the data zone, but the transfer didn't start on a 32KB boundary
+	    MT25Q_SubsectorErase_4KB(flash_addr); // We must erase 4KB to be safe.
+	}
+	// If none of the above are true, it means is_sector_pre_erased == 1
+	// and we are mid-way through a 32KB block. We skip Erase and just Write.
 
-	MT25Q_SubsectorWrite_4KB(flash_addr, (uint8_t*)sect); // // Always write the data received in 'sect'
+	MT25Q_SubsectorWrite_4KB(flash_addr, (uint8_t*)write_buf); // Always write the data received in 'write_buf'
 
-	// 2. Update tracking
-    msc_bytes_remaining -= 4096;
-    write_lba++; // Move to the next 4096-byte LBA
+	//  Update tracking
+	msc_bytes_remaining -= 4096;
+	write_lba++; // Move to the next 4096-byte LBA
 
-    // 3. Check if the Host is still pushing more blocks (e.g., 16 blocks total)
-    if (msc_bytes_remaining > 0) {
-    	// The Host has more data! We must re-arm the OUT EP to catch the next 4096 bytes.
-    	// This prevents the NAK loop on the bus that causes the hang.
-    	uint32_t next_chunk = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
+	// Check if the Host is still pushing more blocks (e.g., 16 blocks total)
+	if (msc_bytes_remaining > 0) {
+		// The Host has more data! We must re-arm the OUT EP to catch the next 4096 bytes.
+		// This prevents the NAK loop on the bus that causes the hang.
+		uint32_t next_chunk = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
 
-    	EndPoint[1].rxBuffer_ptr = (uint8_t*)sect;
-    	EndPoint[1].rxCounter = next_chunk;
+		EndPoint[1].rxBuffer_ptr = (uint8_t*)write_buf;
+		EndPoint[1].rxCounter = next_chunk;
 
-    	USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | next_chunk;
-    	USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
+		USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | next_chunk;
+		USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
 
-    	return; // Exit and wait for the next chunk to arrive
+		 return MSC_OK; // Exit and wait for the next chunk to arrive
     }
 
-    // 4. DATA PHASE FINISHED (msc_bytes_remaining == 0)
+    // DATA PHASE FINISHED (msc_bytes_remaining == 0)
     is_sector_pre_erased = 0;
     current_32k_block = 0xFFFFFFFF;
     // Re-enable Memory Mapping so the next 'Read' works!
@@ -753,10 +757,12 @@ void USB_MSC_WriteComplete_Callback(void) {
 
     // Now send the CSW. The Host has finished sending all data and will finally send an IN token for the status.
     MSC_Send_CSW(msc_tag, 0, 0x00);
+
+    return MSC_OK;
 }
 
 
-static uint8_t MSC_is_blank(uint32_t flash_addr, uint32_t size) {
+__attribute__((unused)) static uint8_t MSC_is_blank(uint32_t flash_addr, uint32_t size) {
     uint8_t check_buf[256];
     uint32_t bytes_checked = 0;
     uint32_t chunk;
@@ -932,11 +938,11 @@ static void MSC_Handle_GetConfiguration(USB_MSC_CBW_t *cbw) {
     msc_state = MSC_STATE_DATA_IN;     // Update state so XFRC ISR knows to send CSW next
 
     // 2. Load the buffer and kick the hardware
-    USB_MSC_setTxBuffer(1, config_header, send_len);  // Your function handles DIEPTSIZ and the initial FIFO fill internally.
+    MSC_setTxBuffer(1, config_header, send_len);  // Your function handles DIEPTSIZ and the initial FIFO fill internally.
 }
 
-static void MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32_t len) {
-    if (len == 0) return;
+static MSC_Status_t MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32_t len) {
+    if (len == 0)  return MSC_FAIL;
 
     QSPI_Prepare_Indirect(); // Abort Mem-Mapped and clear flags
 
@@ -963,13 +969,14 @@ static void MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32_t len) 
             pData[count++] = *(volatile uint8_t *)&QUADSPI->DR;
         }
     }
-
     // 5. Wait for transaction to finish
     while (QUADSPI->SR & QUADSPI_SR_BUSY);
+
+    return MSC_OK;
 }
 
 
-static void USB_MSC_Stall_Endpoints(void) {
+static void MSC_Stall_Endpoints(void) {
     // Halt the Bulk pipes
     USB_EP_IN(1)->DIEPCTL |= USB_OTG_DIEPCTL_STALL;
     USB_EP_OUT(1)->DOEPCTL |= USB_OTG_DOEPCTL_STALL;
@@ -1002,7 +1009,7 @@ static void MSC_Handle_GetEventStatusNotification(USB_MSC_CBW_t *cbw) {
     EndPoint[1].setTxBuffer(1, (uint8_t*)event_data, len); // Your ISR will call MSC_Send_CSW once these 8 bytes are ACKed.
 }
 
-static void USB_MSC_ForceResetState(void) {
+static void MSC_ForceResetState(void) {
 	/*	A "Force Reset" means manually clearing the hardware's status registers, flushing the FIFO buffers,
 		and re-enabling the "listening" state for the next incoming packet. */
 
@@ -1151,7 +1158,7 @@ uint32_t write_Fifo(uint8_t dfifo, uint8_t *src, uint16_t len) {
 * 			EndPoints' Callbacks
 ***************************************************/
 
-static uint32_t USB_MSC_transferTXCallback_EP1(void) {
+static uint32_t MSC_transferTXCallback_EP1(void) {
 
 	uint32_t start_tick = GetSysTick();
 
@@ -1172,7 +1179,7 @@ static uint32_t USB_MSC_transferTXCallback_EP1(void) {
 
     // 1. If there is data to send, configure the Hardware registers
     // During Transfer: If the file is large, the TXFE (FIFO Empty) interrupt in your ISR calls write_Fifo repeatedly until txCounter hits zero.
-    uint32_t len = EndPoint[1].txCounter; // EndPoint[EPnum].txCounter value was set inside USB_MSC_setTxBuffer()
+    uint32_t len = EndPoint[1].txCounter; // EndPoint[EPnum].txCounter value was set inside MSC_setTxBuffer()
     if (len > 0) {
     	// Limit this specific hardware "burst" to 4096 bytes (64 packets)
     	uint32_t chunk_size = (len > 4096) ? 4096 : len;
@@ -1194,7 +1201,7 @@ static uint32_t USB_MSC_transferTXCallback_EP1(void) {
 }
 
 
-uint32_t USB_MSC_transferTXCallback_EP0(void) {
+uint32_t MSC_transferTXCallback_EP0(void) {
     uint16_t len = EndPoint[0].txCounter;
     while(USB_EP_IN(0)->DIEPCTL & USB_OTG_DIEPCTL_EPENA); // not mandatory in case
 
@@ -1228,7 +1235,7 @@ uint32_t USB_MSC_transferTXCallback_EP0(void) {
  * param  EP number, TX Buffer, length
  * retval OK/FAILED
  */
-uint32_t USB_MSC_setTxBuffer(uint8_t EPnum, uint8_t *txBuff, uint32_t len){
+uint32_t MSC_setTxBuffer(uint8_t EPnum, uint8_t *txBuff, uint32_t len){
 
 	/*	When you want to start a transfer (like sending 4096 bytes of a file),
 		you call this. It prepares the variables and then "kicks" the callback to start the hardware.
@@ -1262,7 +1269,7 @@ uint32_t USB_MSC_setTxBuffer(uint8_t EPnum, uint8_t *txBuff, uint32_t len){
 }
 
 
-uint32_t USB_MSC_transferRXCallback_EP1(uint32_t param) {
+uint32_t MSC_transferRXCallback_EP1(uint32_t param) {
 	// 1. Get the actual amount of data the hardware just wrote to memory
 	// (In STM32 OTG, you usually calculate this by looking at how much DOEPTSIZ decremented)
 
@@ -1282,12 +1289,12 @@ uint32_t USB_MSC_transferRXCallback_EP1(uint32_t param) {
 
 	case MSC_STATE_DATA_OUT:
 		// Data has landed in ram_disk, we'll write to the Flash
-		USB_MSC_WriteComplete_Callback();
+		MSC_WriteComplete_Callback();
 		break;
 
 	case MSC_STATE_ERROR:
 		// Handle error state if necessary, or just reset
-		USB_MSC_ForceResetState();
+		MSC_ForceResetState();
 		break;
 
 	default:
@@ -1527,13 +1534,13 @@ void OTG_FS_IRQHandler(){
 	 If USB bus has gone quiet (which happens about 3ms after you unplug the cable or the PC goes to sleep) */
 	if (active_irq & USB_OTG_GINTSTS_USBSUSP){
 		USB_OTG_FS->GINTSTS = USB_OTG_GINTSTS_USBSUSP; // clear flag
-		USB_MSC_ForceResetState(); // Perform the robust cleanup
+		MSC_ForceResetState(); // Perform the robust cleanup
 	}
 
 	/* Wakeup DETECTED - to use uncomment in USB_OTG_FS_init_registers() */
 	if (active_irq & USB_OTG_GINTSTS_WKUINT){
 		USB_OTG_FS->GINTSTS = USB_OTG_GINTSTS_WKUINT; // clear flag
-		USB_MSC_ForceResetState();
+		MSC_ForceResetState();
 	}
 
 
@@ -1544,7 +1551,6 @@ void OTG_FS_IRQHandler(){
 		enumerate_Reset();
 		return;
 	}
-
 
 	/****************** ENUMDNEM event ****************************/
 	/* The core sets this bit to indicate that speed enumeration is complete: the hardware-level connection and speed negotiation (reset/chirp) are complete,
@@ -1726,7 +1732,7 @@ void OTG_FS_IRQHandler(){
 			// XFRC: Transfer completed interrupt. Indicates that the programmed transfer is complete on the AHB as well as on the USB, for this endpoint.
 			if(epint & USB_OTG_DOEPINT_XFRC){
 				USB_EP_OUT(1)->DOEPINT = USB_OTG_DOEPINT_XFRC; // Clear flag
-				USB_MSC_transferRXCallback_EP1(0); // Transfer is finished, the callback can parse the CBW (if IDLE) or handle the Data (if DATA_OUT).
+				MSC_transferRXCallback_EP1(0); // Transfer is finished, the callback can parse the CBW (if IDLE) or handle the Data (if DATA_OUT).
 			}
 			CLEAR_OUT_EP_INTERRUPT(1, epint);
 		}
@@ -1738,7 +1744,7 @@ void OTG_FS_IRQHandler(){
 
 /* The BOT (Bulk-Only Transport) Flow :
     - Host sends CBW (31 bytes) -> RXFLVL ISR -> read_Fifo -> rxBufferEp1.
-    - OUT XFRC ISR -> USB_MSC_transferRXCallback_EP1 calls MSC_Parse_SCSI_Command.
+    - OUT XFRC ISR -> MSC_transferRXCallback_EP1 calls MSC_Parse_SCSI_Command.
     - Parser calls MSC_Handle_Read10.
     - Read10 calls setTxBuffer -> TXCallback_EP1 primes hardware + fills first 128 bytes.
     - ISR (TXFE) refills the FIFO until all data is gone or until 8192 bytes are pushed.

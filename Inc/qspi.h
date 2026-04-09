@@ -1,5 +1,13 @@
 #include "stm32f469xx.h"
 
+
+/*	For a 128Mbit (16MB) Flash with 4096-byte sectors	*/
+#define FLASH_TOTAL_SIZE      (16 * 1024 * 1024) // 16MB
+#define MSC_BLOCK_SIZE        4096
+#define MSC_TOTAL_BLOCKS      (FLASH_TOTAL_SIZE / MSC_BLOCK_SIZE) // 4096
+
+
+
 void QSPI_Hardware_Init(void);
 
 void QSPI_Flash_Reset(void);

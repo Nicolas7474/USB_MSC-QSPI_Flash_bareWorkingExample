@@ -128,13 +128,15 @@ void QSPI_Enable_MemoryMapped(void) {
 }
 
 void QSPI_Prepare_Indirect(void) {
-	// If in Memory-Mapped Mode, we must force an Abort
+
 	if ((QUADSPI->CCR & QUADSPI_CCR_FMODE_Msk) == (3U << QUADSPI_CCR_FMODE_Pos)) {
+		/* In Memory-Mapped Mode, we must force an Abort: the MT25QL Status Register cannot be polled while in MMM.
+		The QSPI peripheral in MMM only knows how to translate memory addresses into SPI read commands. */
 		QUADSPI->CR |= QUADSPI_CR_ABORT;
-		while (QUADSPI->SR & QUADSPI_SR_BUSY); // Must wait after an Abort TODO add a tim
+		while (QUADSPI->CR & QUADSPI_CR_ABORT); // Wait for abort to clear
+		// No need to check QUADSPI_SR_BUSY here, it will done in the function following
 	}
-	// Clear all status flags (Transfer Complete, FIFO Threshold, etc.)
-	QUADSPI->FCR = QUADSPI_FCR_CTCF | QUADSPI_FCR_CSMF | QUADSPI_FCR_CTEF;
+	QUADSPI->FCR = QUADSPI_FCR_CTCF | QUADSPI_FCR_CSMF | QUADSPI_FCR_CTEF; // Clear all status flags (Transfer Complete, FIFO Threshold...)
 }
 
 
@@ -142,11 +144,13 @@ void QSPI_WriteEnable(void) {
 
 	// IMODE = 3 (Quad), Instruction = 0x06 (MT25QL128 write enable)
 	QUADSPI->CCR = (3U << QUADSPI_CCR_IMODE_Pos) | (0x06U << QUADSPI_CCR_INSTRUCTION_Pos); // All other phases (Address, Data, etc.) are 0
-
+	// Wait for the QSPI peripheral to finish sending the 8 bits
+	while (QUADSPI->SR & QUADSPI_SR_BUSY);
 	// Wait for the instruction to be sent (Transfer complete flag)
 	while (!(QUADSPI->SR & QUADSPI_SR_TCF)); // the TCF bit is set in indirect mode when the programmed number of data is transferred
 
 	QUADSPI->FCR = QUADSPI_FCR_CTCF;  // Clear transfer complete flag (Flag Clear Register)
+
 }
 
 
@@ -181,6 +185,7 @@ void QSPI_EnableQuadMode(void) {
 uint8_t QSPI_GetStatus(void) {
 
 	uint32_t timeout = 0;
+	QSPI_Prepare_Indirect();
 	while (QUADSPI->SR & QUADSPI_SR_BUSY)  {
 		timeout++;
 		if (timeout > 500000) return -1;
@@ -202,6 +207,7 @@ uint8_t QSPI_GetStatus(void) {
 void QSPI_WaitUntilReady(void) {
 	// for MT25Q_SubsectorErase_4KB() env. 30ms of polling (0x05)
 	// Bit 0 of Status Register is WIP (Write In Progress)
+	QSPI_Prepare_Indirect(); // necessary to poll (QUADSPI->SR & QUADSPI_SR_BUSY)
 	while (QSPI_GetStatus() & 0x01); // bit 1 = "Write in progress" of MT25QL128 "Read Status Register"
 }
 
@@ -417,12 +423,11 @@ void MT25Q_PageProgram(uint32_t address, uint8_t *pData) {
 void MT25Q_SubsectorWrite_4KB(uint32_t address, uint8_t *data) {
 
 	for(int i=0; i < 16; i++) {
+		Delay_us_TIM7(20);
 		MT25Q_PageProgram(address, &data[i*256]); //  256 bytes per page
 		address += 256;
 	}
 }
-
-
 
 
 static void QSPI_AutoPollingMode(void) {

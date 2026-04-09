@@ -142,7 +142,7 @@ void InterruptGPIO_Config (void)
 	SYSCFG->EXTICR[0] &= ~(0xF<<0);  // Bits[7:6:5:4] = (0:0:0:0) -> configure EXTI1 line for PA1; SYSCFG external interrupt configuration register 1 (SYSCFG_EXTICR1)
 	EXTI->IMR |= (1<<0);  // Bit[0] = 1  --> Disable the Mask on EXTI 1 (Interrupt mask register (EXTI_IMR))
 	EXTI->RTSR |= (1<<0);  // Enable Rising Edge Trigger for PA0 (Rising trigger selection register (EXTI_RTSR))
-	EXTI->FTSR &= ~(1<<0);  // Disable Falling Edge Trigger for PA0 (Falling trigger selection register (EXTI_FTSR))
+	EXTI->FTSR |= (1<<0); // Enable Falling Edge Trigger for PA0  (PA0 is usually active High)
 	NVIC_SetPriority(EXTI0_IRQn, 10);
 	NVIC_EnableIRQ(EXTI0_IRQn);
 

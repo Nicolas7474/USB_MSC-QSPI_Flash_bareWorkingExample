@@ -48,7 +48,6 @@ DSTATUS disk_initialize (BYTE pdrv) {
 	/* Physical drive ID number = 0 */
 	// DSTATUS stat; int result;
 	//result = RAM_disk_initialize();	return stat; // TODO
-
 	return RES_OK;
 }
 
@@ -61,8 +60,8 @@ DSTATUS disk_initialize (BYTE pdrv) {
 DRESULT disk_read (BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
 	// Drive nb / Buffer to store read data / Start sector in LBA / Nb of sectors to read
 
-	if (pdrv != 0) return RES_PARERR; 	// Safety check (support only one drive (0))
 	if (flag_usb_connected) return FR_LOCKED; // The "Low-Level Gate": check if the PC is currently the boss
+	if (pdrv != 0) return RES_PARERR; 	// Safety check (support only one drive (0))
 
 	// Calculate the physical Memory-Mapped address
 	uint32_t flash_addr = 0x90000000 + (sector * FF_MAX_SS); 	// a LBA sector is FF_MAX_SS bytes (4096)
