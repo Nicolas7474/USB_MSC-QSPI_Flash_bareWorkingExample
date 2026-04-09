@@ -84,6 +84,8 @@ uint32_t write_lba;
 uint16_t write_block_count;
 uint32_t msc_tag = 0; // Save the tag from the CBW here
 static uint32_t msc_bytes_remaining = 0;
+static uint8_t is_sector_pre_erased = 0; // Track if the current multi-block transfer already performed a 64KB erase
+static uint32_t current_32k_block = 0xFFFFFFFF;
 
 /****************************************************************
  * 		static functions' declarations
@@ -108,10 +110,11 @@ static void MSC_Handle_Inquiry(USB_MSC_CBW_t *cbw);
 static void MSC_Send_CSW(uint32_t tag, uint32_t residue, uint8_t status);
 static void MSC_Handle_TestUnitReady(USB_MSC_CBW_t *cbw);
 static void MSC_Handle_ReadCapacity10(USB_MSC_CBW_t *cbw);
-static void MSC_Handle_Read10_indir(USB_MSC_CBW_t *cbw);
 static void MSC_Handle_Read10(USB_MSC_CBW_t *cbw);
+static void MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32_t len);
 static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw);
 static void USB_MSC_WriteComplete_Callback(void);
+static uint8_t MSC_is_blank(uint32_t flash_addr, uint32_t size);
 static void MSC_Handle_ModeSense6(USB_MSC_CBW_t *cbw);
 static void USB_MSC_Stall_Endpoints(void);
 static uint32_t USB_MSC_transferTXCallback_EP0(void);
@@ -125,6 +128,7 @@ static void MSC_Update_Sense_Data(uint8_t key, uint8_t asc, uint8_t ascq);
 static void MSC_Handle_ReadFormatCapacity(USB_MSC_CBW_t *cbw);
 static void USB_MSC_ForceResetState(void);
 uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count);
+
 
 /**********************************************************************
  * GetSysTick() is required for Timeout detection in several functions
@@ -610,27 +614,6 @@ static void MSC_Handle_ReadCapacity10(USB_MSC_CBW_t *cbw) {
 }
 
 
-static void MSC_Handle_Read10_indir(USB_MSC_CBW_t *cbw) {
-	// ONLY FOR INDIRECT MODE ! NOT Memory-Mapped.
-	// 1. Parse LBA (Logical Block Addres) and Block Count (Big-Endian to Little-Endian)
-	uint32_t lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | (cbw->CB[5]);
-	uint16_t block_count = (cbw->CB[7] << 8) | cbw->CB[8]; // // Extract Allocation Length from the SCSI CDB (bytes 7 and 8)
-	uint32_t total_bytes = block_count * 512; // 1 LBA = 512 Bytes
-	 // Map the LBA to your actual data source (SD Card or RAM array)
-	uint8_t *data_ptr = Media_Get_LBA_Pointer(lba, block_count);
-	if (data_ptr == NULL) {
-		// Out of bounds - Send SCSI Sense "Illegal Request"
-		MSC_Update_Sense_Data(0x05, 0x24, 0x00);
-		MSC_Send_CSW(cbw->dTag, cbw->dDataTransferLength, 0x01);
-		return;
-	}
-	// 3. Normal Path: Prepare for Data Phase
-	msc_state = MSC_STATE_DATA_IN;
-	msc_tag = cbw->dTag; // Keep for the XFRC interrupt logic
-    // 4. Use your consistent EndPoint method to kick off the transfer
-    EndPoint[1].setTxBuffer(1, data_ptr, total_bytes);
-}
-
 static void MSC_Handle_Read10(USB_MSC_CBW_t *cbw) {
 	// READ_10 (0x28): sends the actual content of the disk - Memory-Mapped Mode, no DMA here !
 
@@ -672,8 +655,8 @@ static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
     You must wait until you have processed the data and sent the CSW (Bulk IN) before you re-enable the Bulk OUT EP for the next CBW. */
 
     // 1. Calculate LBA and Number of Blocks from CDB (Big Endian)
-    write_lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | cbw->CB[5];
-    write_block_count = (cbw->CB[7] << 8) | cbw->CB[8];
+    write_lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | cbw->CB[5]; // LBA
+    write_block_count = (cbw->CB[7] << 8) | cbw->CB[8]; // length
 
     // 2. Calculate TOTAL bytes the Host is going to send
     // Since your ReadCapacity reported 4096, total = write_block_count * 4096
@@ -681,6 +664,7 @@ static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
     msc_bytes_remaining = (uint32_t)write_block_count * 4096;
     msc_tag = cbw->dTag;
     msc_state = MSC_STATE_DATA_OUT;
+    is_sector_pre_erased = 0; // Reset the optimization flag at the start of every new command
 
     // 3. Prepare the first chunk (4096 bytes)
     // We only trigger 4096 at a time to fit your 'sect' buffer
@@ -698,37 +682,87 @@ static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
 }
 
 void USB_MSC_WriteComplete_Callback(void) {
-    // 1. Physically burn to Flash
-    uint32_t flash_addr = write_lba * 4096;
+	// 1. Physically burn to Flash
+	uint32_t flash_addr = write_lba * 4096;
 
-    MT25Q_SubsectorErase(flash_addr);
-    MT25Q_SubsectorWrite(flash_addr, (uint8_t*)sect);
+	// If we haven't erased yet for this command...
+	if (is_sector_pre_erased == 0) {
 
-    // 2. Update tracking
+		// Only use bigger erases if:
+		// We are deep in the disk (past the boot/FAT area, e.g., LBA > 64) + it is perfectly aligned + the length is sufficient
+		// 32KB sector formating was found slightly faster than 64KB (and obviously 4KB) for transfers PC -> STM32
+		// to comply with 64KB sector formating: change to "write_lba % 16 == 0" and "(...4096 >= 65535))"
+		if (write_lba > 64 && (write_lba % 8 == 0) && (msc_bytes_remaining + 4096 >= 32768)) {
+			if (current_32k_block != (write_lba / 8)) {
+				// Perform Blank Check before Erasing
+				if (MSC_is_blank(flash_addr, 32768) == 0) {
+					GPIOD->ODR^=GPIO_ODR_OD5;
+					MT25Q_SubsectorErase_32KB(flash_addr);
+				}
+			}
+			current_32k_block = (write_lba / 8);
+			is_sector_pre_erased = 1;
+
+		} else {
+			// Standard safe mode for formatting/metadata
+			if (MSC_is_blank(flash_addr, 4096) == 0) {
+				GPIOD->ODR^=GPIO_ODR_OD4;
+				MT25Q_SubsectorErase_4KB(flash_addr);
+			}
+		}
+	}
+
+	MT25Q_SubsectorWrite_4KB(flash_addr, (uint8_t*)sect); // // Always write the data received in 'sect'
+
+	// 2. Update tracking
     msc_bytes_remaining -= 4096;
     write_lba++; // Move to the next 4096-byte LBA
 
     // 3. Check if the Host is still pushing more blocks (e.g., 16 blocks total)
     if (msc_bytes_remaining > 0) {
-        // The Host has more data! We must re-arm the OUT EP to catch the next 4096 bytes.
-        // This prevents the NAK loop on the bus that causes the hang.
-        uint32_t next_chunk = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
+    	// The Host has more data! We must re-arm the OUT EP to catch the next 4096 bytes.
+    	// This prevents the NAK loop on the bus that causes the hang.
+    	uint32_t next_chunk = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
 
-        EndPoint[1].rxBuffer_ptr = (uint8_t*)sect;
-        EndPoint[1].rxCounter = next_chunk;
+    	EndPoint[1].rxBuffer_ptr = (uint8_t*)sect;
+    	EndPoint[1].rxCounter = next_chunk;
 
-        USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | next_chunk;
-        USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
+    	USB_EP_OUT(1)->DOEPTSIZ = (64 << 19) | next_chunk;
+    	USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
 
-        return; // Exit and wait for the next chunk to arrive
+    	return; // Exit and wait for the next chunk to arrive
     }
 
     // 4. DATA PHASE FINISHED (msc_bytes_remaining == 0)
+    is_sector_pre_erased = 0;
+    current_32k_block = 0xFFFFFFFF;
     // Re-enable Memory Mapping so the next 'Read' works!
     QSPI_Enable_MemoryMapped();
 
     // Now send the CSW. The Host has finished sending all data and will finally send an IN token for the status.
     MSC_Send_CSW(msc_tag, 0, 0x00);
+}
+
+
+static uint8_t MSC_is_blank(uint32_t flash_addr, uint32_t size) {
+    uint8_t check_buf[256];
+    uint32_t bytes_checked = 0;
+    uint32_t chunk;
+
+    while (bytes_checked < size) {
+        chunk = (size - bytes_checked > 256) ? 256 : (size - bytes_checked);
+
+        // This replaces the pointer access that was crashing the system
+        MT25Q_Read_Indirect(flash_addr + bytes_checked, check_buf, chunk);
+
+        for (uint16_t i = 0; i < chunk; i++) {
+            if (check_buf[i] != 0xFF) {
+                return 0; // Found data, must erase!
+            }
+        }
+        bytes_checked += chunk;
+    }
+    return 1; // It's all 0xFF
 }
 
 static void MSC_Handle_ModeSense6(USB_MSC_CBW_t *cbw) {
@@ -888,6 +922,40 @@ static void MSC_Handle_GetConfiguration(USB_MSC_CBW_t *cbw) {
     // 2. Load the buffer and kick the hardware
     USB_MSC_setTxBuffer(1, config_header, send_len);  // Your function handles DIEPTSIZ and the initial FIFO fill internally.
 }
+
+static void MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32_t len) {
+    if (len == 0) return;
+
+    QSPI_Prepare_Indirect(); // Abort Mem-Mapped and clear flags
+
+    // 1. Configure Data Length
+    QUADSPI->DLR = len - 1;
+
+    // 2. Configure CCR for Indirect Read
+    // Using 4-4-4 mode (IMODE=3, ADMODE=3, DMODE=3) to match your Erase setup
+    QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos)  | // 01: Indirect Read mode
+                   (2U << QUADSPI_CCR_ADSIZE_Pos) | // 2: 24-bit address
+                   (3U << QUADSPI_CCR_DMODE_Pos)  | // 3: Data on 4 lines
+                   (3U << QUADSPI_CCR_ADMODE_Pos) | // 3: Address on 4 lines
+                   (3U << QUADSPI_CCR_IMODE_Pos)  | // 3: Instruction on 4 lines
+                   (0x03U << QUADSPI_CCR_INSTRUCTION_Pos); // 0x03: Normal Read
+
+    // 3. Set Address and Trigger
+    QUADSPI->AR = address;
+
+    // 4. Manual FIFO Read Loop
+    uint32_t count = 0;
+    while (count < len) {
+        // Wait until there is at least 1 byte in the FIFO
+        if (QUADSPI->SR & QUADSPI_SR_FLEVEL_Msk) {
+            pData[count++] = *(volatile uint8_t *)&QUADSPI->DR;
+        }
+    }
+
+    // 5. Wait for transaction to finish
+    while (QUADSPI->SR & QUADSPI_SR_BUSY);
+}
+
 
 static void USB_MSC_Stall_Endpoints(void) {
     // Halt the Bulk pipes
@@ -1106,13 +1174,6 @@ static uint32_t USB_MSC_transferTXCallback_EP1(void) {
 
         // If we have more than 128 bytes, enable the Empty FIFO interrupt
         if (chunk_size > 128) USB_OTG_DEVICE->DIEPEMPMSK |= (1 << 1);
-
-        if(asked == 1) {
-            	uint8_t po = 0;
-            	po = po +1 ; //TODO
-            	po = po + 2;
-            	//while(USB_EP_IN(1)->DIEPCTL & USB_OTG_DIEPCTL_EPENA);
-            }
     }
 
 
@@ -1660,6 +1721,7 @@ void OTG_FS_IRQHandler(){
 		return;
 	}
 }
+
 
 
 /* The BOT (Bulk-Only Transport) Flow :

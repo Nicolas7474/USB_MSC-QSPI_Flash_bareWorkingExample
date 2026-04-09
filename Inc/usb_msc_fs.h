@@ -262,8 +262,8 @@ and the host controller will flag a "babble" error or a PID sequence error.*/
 #define USBD_VID				1155
 #define USBD_LANGID_STRING			1033
 #define USBD_MANUFACTURER_STRING		"STMicroelectronics"
-#define USBD_PID_FS				0x5720
-#define USBD_PRODUCT_STRING_FS			"STM32 Virtual ComPort"
+#define USBD_PID_FS				0x5721
+#define USBD_PRODUCT_STRING_FS			"STM32 Flash Mass Storage"
 
 #define DEVICE_DESCRIPTOR_LENGTH		18
 #define CONFIGURATION_DESCRIPTOR_LENGTH 32
