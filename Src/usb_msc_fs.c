@@ -11,13 +11,17 @@
 
 #include "stm32f4xx.h"
 #include "stm32f469xx.h"
+#include "main.h"
 #include "usb_msc_fs.h"
 #include "qspi.h"
+#include "ff.h" // only needed for f_mount() function
 #include "timers.h"
 
 uint8_t chk = 0;
 uint8_t asked = 0;
 uint8_t sect[4096];
+volatile uint8_t flag_fatfs_busy = 0;
+volatile uint8_t flag_usb_connected;
 
 /* RX buffers for Endpoint structure*/
 #define RX_BUFFER_EP0_SIZE 64U // 8 is normally enough but 64 costs almost nothing in RAM and can prevent the most common USB crashes
@@ -95,8 +99,8 @@ static uint32_t current_32k_block = 0xFFFFFFFF;
 static inline void set_device_status(eDeviceState state);
 
 /* Init EP */
-static void initEndPoints(void);
-static void USB_MSC_Activate_Endpoints(void);
+static void init_EndPoints(void);
+static void activate_Endpoints(void);
 
 /* FIFO handler */
 static inline void set_FIFOs_sz(void);
@@ -157,14 +161,8 @@ uint32_t GetSysTick(void) { return msTicks; } // GetTick: this is a direct repla
 *
 ***************************************************/
 
-/**
-* brief  USB OTG HARDWARE bare-metal configuration RCC CLOCKS GPIO
-* Note  Model-dependant - here for STM32F469
-* param
-* retval
-* A11 and A12
-*/
 uint32_t USB_OTG_FS_Init(void) {
+	/* configuration RCC CLOCKS GPIO ; Model-dependant (example for STM32F469) */
 
 	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
 	GPIOA->MODER &= ~(GPIO_MODER_MODER11 | GPIO_MODER_MODER12); //  Configure PA11 (DM) and PA12 (DP) as Alternate Function (AF10)
@@ -243,12 +241,7 @@ uint32_t USB_OTG_FS_Init(void) {
 	return EP_OK;
 }
 
-/**
-* brief  Init general settings of USB_OTG periph
-* param
-* param
-* retval
-*/
+
 void USB_OTG_FS_init_registers(){
 
 	device_state = DEVICE_STATE_DEFAULT;
@@ -274,7 +267,7 @@ void USB_OTG_FS_init_registers(){
 	set_FIFOs_sz();
 
 	// Initialize the structure of all EP (EP1, EP2 are hardware-enabled later in Activate_Composite_Endpoints()) and
-	initEndPoints(); 					   // the Hardware for EP0: the STM32 can thus receive the first SETUP packet
+	init_EndPoints(); 					   // the Hardware for EP0: the STM32 can thus receive the first SETUP packet
 
 	// Set TXFE level to 'Completely Empty' in the Global AHB Config Register (check space before loading bytes into Fifo)
 	USB_OTG_FS->GAHBCFG |= USB_OTG_GAHBCFG_TXFELVL; // (1U << 7)
@@ -294,13 +287,9 @@ void USB_OTG_FS_init_registers(){
 	SysTick_init(); // may be optional if you provide your own SysTick_Handler() / GetSysTick() functions
 }
 
-/**
-* brief  fill endpoint structures with initial data
-* param
-* param
-* retval
-*/
-static void initEndPoints(){
+
+static void init_EndPoints(){
+	/*	Fill endpoint structures with initial data */
 
 	for (uint32_t i = 0; i < EP_COUNT; i++) {
 			/* Global defaults for all Endpoints */
@@ -333,7 +322,8 @@ static void initEndPoints(){
 	    USB_OTG_DEVICE->DCTL &= ~USB_OTG_DCTL_SDIS;     // Soft connect
 }
 
-static void USB_MSC_Activate_Endpoints(void) {
+
+static void activate_Endpoints(void) {
     // --- Configure Bulk IN (Endpoint 1) ---
     USB_EP_IN(1)->DIEPCTL &= ~(USB_OTG_DIEPCTL_MPSIZ | USB_OTG_DIEPCTL_EPTYP | USB_OTG_DIEPCTL_TXFNUM);
     USB_EP_IN(1)->DIEPCTL |= (64 << 0)                // Max Packet Size
@@ -380,7 +370,36 @@ static inline void set_FIFOs_sz(){
 
 /****************************************************
 * 	Miscellaneous service functions*
-***************************************************/
+*****************************************************/
+
+void maintenance_switch(void) {
+	/*switch between USB and FATfs control over the Flash*/
+
+	// Check if USB is currently DISCONNECTED (SDIS bit is set)
+	if (USB_OTG_DEVICE->DCTL & USB_OTG_DCTL_SDIS) {
+
+		f_mount(NULL, "0:", 0); // Effectively "closes" the filesystem in the CPU RAM
+		flag_usb_connected = 1; // Block the STM32 from starting any new writes
+		while (flag_fatfs_busy); // The "Atomic" Handover Logic: Wait for any existing write to finish ("Busy" flag check)
+
+        // --- GOING TO USB MODE ---
+        QSPI_WaitUntilReady();  // Wait for physical Flash to finish any background Erase/Write
+        //NBdelay_ms(10); //  Safety Delay, give the CPU a moment to clear any pending background tasks
+        USB_OTG_DEVICE->DCTL &= ~USB_OTG_DCTL_SDIS;  // Enable USB (Clear SDIS)
+        // UART_Send("USB Attached - FATfs Locked\r\n");
+    }
+    else {
+        // --- GOING TO FATfs MODE ---
+    	FRESULT res;
+    	USB_OTG_DEVICE->DCTL |= USB_OTG_DCTL_SDIS;   // Eject USB (Set SDIS)
+        QSPI_WaitUntilReady(); // Wait for Flash Ready (the PC might have been writing right when the button was pressed)
+        NBdelay_ms(500);   // Safety Delay: Windows takes a moment to realize the device is gone.
+        flag_usb_connected = 0; // Tell the STM32 logic it's safe to work again
+    	// Mount the drive - This doesn't "touch" the flash much; it just tells FatFs to initialize the fs structure and prepare for communication.
+    	res = f_mount(&fs, "0:", 1); //  "": Defaut Drive (number 0) ; 1: Forced mount (checks for FAT structure immediately)
+    	if (res != FR_OK) {	/* If res is FR_NO_FILESYSTEM*/ }
+    }
+}
 
 static void Get_ID_To_String(uint8_t *dest) {
 	// Pointer to the UID start address (Adjust for your specific STM32)
@@ -617,38 +636,32 @@ static void MSC_Handle_ReadCapacity10(USB_MSC_CBW_t *cbw) {
 static void MSC_Handle_Read10(USB_MSC_CBW_t *cbw) {
 	// READ_10 (0x28): sends the actual content of the disk - Memory-Mapped Mode, no DMA here !
 
-    // 1. Extract LBA and Block Count from SCSI Command: you must parse the CBW to know which sector the PC wants
+    // Extract LBA and Block Count from SCSI Command: you must parse the CBW to know which sector the PC wants
     uint32_t lba = (cbw->CB[2] << 24) | (cbw->CB[3] << 16) | (cbw->CB[4] << 8) | cbw->CB[5];
     uint16_t block_count = (cbw->CB[7] << 8) | cbw->CB[8];
 
-    // 2. Calculate the source address and total length
-    // Each LBA represents 4096 bytes with "Option B" strategy (Option A = 512 bytes)
+    // Calculate the source address and total length
     uint32_t total_bytes = (uint32_t)block_count * 4096;
-    uint32_t flash_addr = 0x90000000 + (lba * 4096);
+    uint32_t flash_addr = 0x90000000 + (lba * 4096);  // Each LBA represents 4096 bytes
 
-    // 3. Prepare the Global State
-    msc_tag = cbw->dTag;
+    msc_tag = cbw->dTag; 	// Set the Global State
     msc_state = MSC_STATE_DATA_IN;
 
-    // 4. Use your custom buffer setter to "kick" the transfer
-    // We pass the Flash address as if it were a normal pointer
+    // Kick the transfer - pass the Flash address as if it were a normal pointer
     if (USB_MSC_setTxBuffer(1, (uint8_t*)flash_addr, total_bytes) != EP_OK) {
-        // If the endpoint was busy, we stall or handle error
         USB_MSC_Stall_Endpoints();
-        return;
+        return; // If the endpoint was busy, we stall or handle error
     }
-
-    // The USB_MSC_setTxBuffer will now:
-    // - Set the pointer to 0x90000000 + offset
-    // - Set the counter to 4096 (or more)
-    // - Call txCallBack() which fills the first packets from Flash
-    // - Enable DIEPEMPMSK to continue filling the FIFO as it empties
+    	/* The USB_MSC_setTxBuffer will now:
+    	 - Set the pointer to 0x90000000 + offset
+     	 - Set the counter to 4096 (or more)
+     	 - Call txCallBack() which fills the first packets from Flash
+     	 - Enable DIEPEMPMSK to continue filling the FIFO as it empties */
 }
 
 static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
-    /* When you receive the WRITE_10 command in your parser, you aren't ready to send a CSW yet.
-    You must first "prime" the OUT EP to catch the data the Host is about to dump on you.
-    Flow of control:
+    /* When you receive the WRITE_10 command in your parser, you must first "prime" the OUT EP to catch the
+       data the Host is about to dump on you. Flow of control:
     1) CBW Arrives: MSC_Handle_Write10 is called. It enables the OUT EP to receive 4096 bytes.
     2) Data Arrives: USB_MSC_transferRXCallback_EP1 fires.
     3) The Trap: In your CDC project, the RX callback probably automatically re-enabled the EP to "listen" again. Do not do this during an MSC Write.
@@ -666,8 +679,7 @@ static void MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
     msc_state = MSC_STATE_DATA_OUT;
     is_sector_pre_erased = 0; // Reset the optimization flag at the start of every new command
 
-    // 3. Prepare the first chunk (4096 bytes)
-    // We only trigger 4096 at a time to fit your 'sect' buffer
+    // 3. Prepare the first chunk - only trigger 4096 at a time to fit the 'sect' buffer
     uint32_t chunk_size = (msc_bytes_remaining > 4096) ? 4096 : msc_bytes_remaining;
 
     // Point USB hardware to your workspace RAM buffer
@@ -1315,7 +1327,7 @@ void enumerate_Reset(){
 	/************************************************************/
 	/* 3. RECONFIGURE ENDPOINTS 							    */
 	/************************************************************/
-	initEndPoints(); // Hardware-enable EP0 and reassert EP1/EP2 structure
+	init_EndPoints(); // Hardware-enable EP0 and reassert EP1/EP2 structure
 
 	USB_OTG_FS->GINTSTS &= ~0xFFFFFFFF; // reset OTG core interrupt register
 
@@ -1428,7 +1440,7 @@ void enumerate_Setup(){
 		break;
 	case REQ_TYPE_DEVICE_TO_HOST_SET_CONFIGURATION: 			/* Request 0x0900  */
 		len=0; // ZLP
-		USB_MSC_Activate_Endpoints(); // Activate the actual Bulk pipes now that the host has selected this config
+		activate_Endpoints(); // Activate the actual Bulk pipes now that the host has selected this config
 		device_state = DEVICE_STATE_CONFIGURED;
 		break;
 	case CLEAR_FEATURE_ENDP: 						/* Request 0x0201  */

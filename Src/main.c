@@ -1,12 +1,12 @@
 /*********************************************************/
-/*   Bare-Metal USB MSC + QSPI Flash MT25QL128
+/* Bare-Metal USB MSC + QSPI Flash MT25QL128
  *
- * Working example 			***/
-/*Main Functions: 				*/
+ * Working example 				*/
+/* Main Functions: 				*/
 /* readID, MT25Q_SubsectorErase, MT25Q_SubsectorRead, MT25Q_PageProgram, MT25Q_SubsectorWrite */
-/**  DMA for Indirect sub-sector Read (4KB) 	***/
-/*	 Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()		*/
-/* 	 Nicolas Prata 2026								   ***/
+/* DMA for Indirect sub-sector Read (4KB) 	***/
+/* Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()		*/
+/* Nicolas Prata 2026								   ***/
 /*********************************************************/
 
 #include <stdio.h>
@@ -16,7 +16,6 @@
 #include "qspi.h"
 #include "myConfig.h"
 #include "timers.h"
-#include "ff.h" 		// FatFs core
 #include "diskio.h" 	// FatFs driver wrappers
 #include "uart3.h"
 #include "ff_func.h" 	// examples of FATfs functions
@@ -25,6 +24,13 @@ uint32_t first_byte;
 uint32_t uid;
 uint8_t flag = 0;
 //uint8_t sector[4096] __attribute__((aligned(4)));
+
+/***** FATfs *****/
+FATFS fs;        	  // Pointer to the filesystem object (The "Drive" instance)
+FRESULT res;         // Check if operations succeed
+//FIL fil;           // File object (The "Open File" instance)
+//UINT br;           // Store how many bytes were actually read
+
 
 int main (void)
 {
@@ -52,13 +58,12 @@ int main (void)
 
 
 	QSPI_Enable_MemoryMapped(); //  Ensure QSPI_Enable_MemoryMapped() has been called before the first USB Read request arrives
-
+	USB_OTG_DEVICE->DCTL |= USB_OTG_DCTL_SDIS;  // disable USB
 	NBdelay_ms(2000);
 
-	// Mount the drive - This doesn't "touch" the flash much; it just tells FatFs to initialize the fs structure and prepare for communication.
-	res = f_mount(&fs, "0:", 1); //  "": Defaut Drive (number 0) ; 1: Forced mount (checks for FAT structure immediately)
-	if (res != FR_OK) {	/* If res is FR_NO_FILESYSTEM*/ }
 
+	res = f_mount(&fs, "0:", 1); //  "": Defaut Drive (number 0) ; 1: Forced mount (checks for FAT structure immediately)
+	if (res != FR_OK) {	GPIOG->ODR^=GPIO_ODR_OD6; /* If res is FR_NO_FILESYSTEM*/ }
 	NBdelay_ms(100);
 	append_to_file((char *)"example.txt", ((char *)"\r\nI wanna dance with somebody.\r\n"));
 	disp_lines((char *)"example.txt");
@@ -72,12 +77,9 @@ int main (void)
 
 		if(flag) { 	// "USB Maintenance" Button pressed
 			NBdelay_ms(50);  // avoid debouncing
-
-
-
-
+			maintenance_switch();
+			GPIOG->ODR^=GPIO_ODR_OD6; // green
 			flag = 0;
-
 		}
 
 	}
@@ -89,8 +91,8 @@ int main (void)
 void EXTI0_IRQHandler() {
 
 	if (EXTI->PR & (1<<0)) {  // button pushed : if the PA0 triggered the interrupt
-		flag = 1;
 		EXTI->PR |= (1<<0);  // Clear the interrupt flag by writing a 1
+		flag = 1;
 	}
 }
 

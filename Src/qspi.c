@@ -9,10 +9,10 @@
 /* 	 Nicolas Prata 2026								   ***/
 /*********************************************************/
 
-#include "qspi.h"
-#include "main.h"
 #include "stm32f4xx.h"
 #include "stm32f469xx.h"
+#include "main.h"
+#include "qspi.h"
 #include "timers.h"
 
 

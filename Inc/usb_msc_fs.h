@@ -232,13 +232,11 @@ uint32_t USB_FlushRxFifo(uint32_t timeout);
 
 uint32_t check_USB_device_status(eDeviceState state);
 void clear_USB_device_status(eDeviceState state);
+void maintenance_switch (void);
 
 /* User code functions */
 
-
 extern volatile uint32_t msTicks;
-
-
 
 /******************************************************************************
 * USB MSC device descriptors
