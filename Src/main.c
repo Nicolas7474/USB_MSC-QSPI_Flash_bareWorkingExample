@@ -33,7 +33,6 @@
 #include "uart3.h"
 #include "usb_msc_fs.h"
 #include "qspi.h"
-#include "myConfig.h"
 #include "diskio.h" 	// FatFs driver wrappers
 #include "ff_func.h" 	// a few homemade FATfs functions
 
@@ -56,6 +55,7 @@ int main (void)
 	SysClockConfig();
 	GPIO_Config();
 	InterruptGPIO_Config();
+	ITM_Init();
 	GPIOD->ODR^=GPIO_ODR_OD4; //orange
 	GPIOD->ODR^=GPIO_ODR_OD5; // red
 	GPIOG->ODR^=GPIO_ODR_OD6; // green
@@ -67,7 +67,7 @@ int main (void)
 	while(Ut_s != Bare_OK);
 
 	uid = MT25Q_readID();
-	if(uid != 0x18BA20) return -1; // don't start if the correct Flash ID isn't read
+	if(uid != DEVICE_ID) return -1; // don't start if the correct Flash ID isn't read
 	QSPI_EnableQuadMode(); // comment to stay on SPI extended (1-1-1)
 
 	USB_OTG_DEVICE->DCTL |= USB_OTG_DCTL_SDIS;  // disable USB at startup - to enable press button PA0
@@ -79,9 +79,9 @@ int main (void)
 	if (res != FR_OK) {	GPIOG->ODR^=GPIO_ODR_OD6; /* If res is FR_NO_FILESYSTEM*/ }
 	NBdelay_ms(1000);
 
-//	append_to_file((char *)"example.txt", ((char *)"\r\nI wanna dance with somebody.\r\n"));
-//	disp_lines((char *)"example.txt");
-//	list_dir((char *)"number1");
+	//	append_to_file((char *)"example.txt", ((char *)"\r\nI wanna dance with somebody.\r\n"));
+	//	disp_lines((char *)"example.txt");
+	//	list_dir((char *)"number1");
 
 	 // MT25Q_BulkErase(); // format the Flash with 0xFF (Windows formats with 0x00)
 
@@ -91,11 +91,13 @@ int main (void)
 		if (was_long_press) {
 			NBdelay_ms(50);  // avoid debouncing
 		    maintenance_switch();
+		    // turn on / off the led according to the real state of the USB
+		    if(USB_OTG_DEVICE->DCTL & USB_OTG_DCTL_SDIS) GPIOG->BSRR = GPIO_BSRR_BS6;
+		    else GPIOG->BSRR = GPIO_BSRR_BR6;
 		    was_long_press = 0; // Reset for next time
 		}
 	}
 }
-
 
 // ISR PAO button input - both edges detection activated
 void EXTI0_IRQHandler(void) {
@@ -110,7 +112,6 @@ void EXTI0_IRQHandler(void) {
         // 2. Button Released (Falling Edge)
         else if (!(GPIOA->IDR & (1 << 0)) && pushed == 1) {
             pushed = 0;
-            GPIOG->ODR^=GPIO_ODR_OD6; // green
             uint32_t duration = GetSysTick() - TicksMs;
             // Only trigger if it was a deliberate press
             if (duration > 150) {

@@ -10,6 +10,7 @@
 
 /* MT25QL128 Command Definitions */
 #define READ_ID 					0x9E
+#define DEVICE_ID 					0x18BA20
 #define READ 						0x03
 #define FAST_READ 					0x0B
 #define WRITE_ENABLE 				0x6B

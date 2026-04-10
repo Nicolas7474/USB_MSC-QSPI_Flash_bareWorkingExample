@@ -644,11 +644,13 @@ MSC_Status_t MSC_WriteComplete_Callback(void) {
 	else if (write_lba % 8 == 0) {
 	    // Start of a new 32KB chunk: Erase the whole thing once
 	    MT25Q_SubsectorErase_32KB(flash_addr); // 32KB block erase is faster than 4KB
-	    is_sector_pre_erased = 1;  GPIOD->ODR^=GPIO_ODR_OD5;
+	    is_sector_pre_erased = 1;
+	    //SWV_SendString("32KB_Erased_");
 	}
 	else if (is_sector_pre_erased == 0) {
 	    // We are in the data zone, but the transfer didn't start on a 32KB boundary
 	    MT25Q_SubsectorErase_4KB(flash_addr); // We must erase 4KB to be safe.
+	    //SWV_SendString("4KB_Erased_");
 	}
 	// If none of the above are true, it means is_sector_pre_erased == 1
 	// and we are mid-way through a 32KB block. We skip Erase and just Write.

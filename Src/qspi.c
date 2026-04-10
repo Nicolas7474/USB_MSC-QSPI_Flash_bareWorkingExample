@@ -227,7 +227,7 @@ uint32_t MT25Q_readID(void) {
 	QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos) |	// Functional mode: Indirect-READ mode
 			(1U << QUADSPI_CCR_DMODE_Pos) | // Data 1 line
 			(1U << QUADSPI_CCR_IMODE_Pos) | // Inst 1 line: send the Command on 1 wire
-			(0x9E << QUADSPI_CCR_INSTRUCTION_Pos); // Read MT25QL128 Status Register (can be read continuously and at any time)
+			(READ_ID << QUADSPI_CCR_INSTRUCTION_Pos);
 
 	while (!(QUADSPI->SR & QUADSPI_SR_TCF));
 	id = QUADSPI->DR;

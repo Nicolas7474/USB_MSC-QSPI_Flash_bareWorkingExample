@@ -9,4 +9,5 @@ void GPIO_Config (void);
 
 void InterruptGPIO_Config (void);
 
-
+void ITM_Init(void);
+void SWV_SendString(const char *str);

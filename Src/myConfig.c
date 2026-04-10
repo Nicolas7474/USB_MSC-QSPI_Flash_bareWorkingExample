@@ -132,7 +132,6 @@ void GPIO_Config (void)
 	GPIOG->BSRR = (1U << 13); // set the PG13 to #1
 	GPIOD->OTYPER &= ~(1 << 4); // orange Led PD4 in P-P
 	GPIOD->OTYPER &= ~(1 << 10); // rouge Led PD5 in P-P
-
 }
 
 
@@ -145,8 +144,21 @@ void InterruptGPIO_Config (void)
 	EXTI->FTSR |= (1<<0); // Enable Falling Edge Trigger for PA0  (PA0 is usually active High)
 	NVIC_SetPriority(EXTI0_IRQn, 10);
 	NVIC_EnableIRQ(EXTI0_IRQn);
-
 }
 
+void ITM_Init(void) {
+    // Enable Trace in the Debug Exception and Monitor Control Register
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; // DEMCR: 32-bit Debug Exception and Monitor Control Register. Provides Vector Catching and Debug Monitor Control.
+    // Unlock the ITM Lock Access Register (Magic Key)
+    ITM->LAR = 0xC5ACCE55;
+    // Enable the ITM Control Register and Stimulus Port 0
+    ITM->TCR |= ITM_TCR_ITMENA_Msk;
+    ITM->TER |= (1UL << 0);
+}
 
+void SWV_SendString(const char *str) {
+    while (*str) {
+        ITM_SendChar(*str++);
+    }
+}
 

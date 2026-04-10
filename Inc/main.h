@@ -1,5 +1,6 @@
 
 #include <stdint.h>
+#include "myConfig.h"
 #include "ff.h" // FatFs core
 
 uint32_t USB_CDC_receive_data(uint16_t length);
