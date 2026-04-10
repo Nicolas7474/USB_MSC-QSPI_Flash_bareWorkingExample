@@ -644,9 +644,9 @@ MSC_Status_t MSC_WriteComplete_Callback(void) {
 	else if (write_lba % 8 == 0) {
 	    // Start of a new 32KB chunk: Erase the whole thing once
 	    MT25Q_SubsectorErase_32KB(flash_addr); // 32KB block erase is faster than 4KB
-	    is_sector_pre_erased = 1; GPIOD->ODR^=GPIO_ODR_OD4;
+	    is_sector_pre_erased = 1;  GPIOD->ODR^=GPIO_ODR_OD5;
 	}
-	else if (is_sector_pre_erased == 0) { GPIOD->ODR^=GPIO_ODR_OD5;
+	else if (is_sector_pre_erased == 0) {
 	    // We are in the data zone, but the transfer didn't start on a 32KB boundary
 	    MT25Q_SubsectorErase_4KB(flash_addr); // We must erase 4KB to be safe.
 	}
@@ -674,10 +674,10 @@ MSC_Status_t MSC_WriteComplete_Callback(void) {
 		 return MSC_OK; // Exit and wait for the next chunk to arrive
 	}
 	// CHECK FOR HARDWARE FAILURE (Last possible moment)
-	if (QSPI_GetStatus(0x70) & 0x30) {			 // bits 4 and 5 of Flag status register
+	if (QSPI_GetStatus(READ_FLAG_STATUS_REGISTER) & 0x30) {			 // bits 4 and 5 of Flag status register
 		MSC_Update_Sense_Data(0x03, 0x03, 0x00); // MEDIUM ERROR, SCSI_AS_WRITE_FAULT
 		write_status = MSC_FAIL;
-		MT25Q_SendCommand(0x50); // Clear the flags from status register
+		MT25Q_SendCommand(CLEAR_FLAG_STATUS_REGISTER); // Clear the flags from status register
 	}
 
 	// DATA PHASE FINISHED (msc_bytes_remaining == 0)
@@ -695,12 +695,12 @@ MSC_Status_t MSC_WriteComplete_Callback(void) {
 
 
 __attribute__((unused)) static uint8_t MSC_is_blank(uint32_t flash_addr, uint32_t size) {
-    uint8_t check_buf[256];
+    uint8_t check_buf[PAGE_SIZE];
     uint32_t bytes_checked = 0;
     uint32_t chunk;
 
     while (bytes_checked < size) {
-        chunk = (size - bytes_checked > 256) ? 256 : (size - bytes_checked);
+        chunk = (size - bytes_checked > PAGE_SIZE) ? PAGE_SIZE : (size - bytes_checked);
 
         // This replaces the pointer access that was crashing the system
         MT25Q_Read_Indirect(flash_addr + bytes_checked, check_buf, chunk);
@@ -888,7 +888,7 @@ static MSC_Status_t MT25Q_Read_Indirect(uint32_t address, uint8_t *pData, uint32
                    (3U << QUADSPI_CCR_DMODE_Pos)  | // 3: Data on 4 lines
                    (3U << QUADSPI_CCR_ADMODE_Pos) | // 3: Address on 4 lines
                    (3U << QUADSPI_CCR_IMODE_Pos)  | // 3: Instruction on 4 lines
-                   (0x03U << QUADSPI_CCR_INSTRUCTION_Pos); // 0x03: Normal Read
+                   (READ << QUADSPI_CCR_INSTRUCTION_Pos); // 0x03: Normal Read
 
     // 3. Set Address and Trigger
     QUADSPI->AR = address;
