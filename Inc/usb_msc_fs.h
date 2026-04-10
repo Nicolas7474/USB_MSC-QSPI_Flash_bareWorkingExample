@@ -1,7 +1,3 @@
-#ifndef STM32F469_USBDFS_MSC_H_INCLUDED
-#define STM32F469_USBDFS_MSC_H_INCLUDED
-
-
 /****************************************************************
 * STM32F469
 * USB OTG FS device (MSC) implementation
@@ -9,6 +5,8 @@
 * Nicolas Prata 2026
 *
 ****************************************************************/
+#ifndef STM32F469_USBDFS_MSC_H_INCLUDED
+#define STM32F469_USBDFS_MSC_H_INCLUDED
 
 #include <string.h>
 #include "stm32f469xx.h"

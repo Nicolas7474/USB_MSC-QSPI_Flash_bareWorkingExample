@@ -1,13 +1,13 @@
-/***************************************************************************************************************
+/****************************************************************************************************
 * STM32F469
-* USB OTG FS device (MSC) implementation  - Nicolas Prata - 2026
-* Lightweight, only two files to integrate to your project: usb_msc_fs.c and usb_msc_fs.h
+* USB OTG FS device Mass Storage (MSC) implementation  - Nicolas Prata - 2026
+* Lightweight, only two MSC files to integrate to your project: usb_msc_fs.c and usb_msc_fs.h
 * Usage:
-
-    - You can edit the descriptors on usb_MSC_fs.h file, to use different values than provided with STM HAL example
-    - Slave-mode only (DMA not available on USB Full Speed with PA11 - PA12)
-*
-***********************************************************************************************************************/
+    - You can edit the descriptors on usb_MSC_fs.h file
+    - USB Slave-mode only (DMA not available on USB Full Speed with PA11 - PA12)
+* Added support for on-board QSPI Flash MT25QL128 and the FATfs library
+* Format to exFAT (32KB alloc size is faster for large transfers but for small files keep 4096KB)
+******************************************************************************************************/
 
 #include "stm32f4xx.h"
 #include "stm32f469xx.h"
@@ -32,11 +32,6 @@ volatile uint8_t flag_usb_connected;
 #define RX_BUFFER_EP1_SIZE (1024 * 32) // -> 32KB (out of 384 KB of system RAM) improves the performance, Windows can send 16 sectors without interrupts.
 static uint8_t rxBufferEp0[RX_BUFFER_EP0_SIZE]; /* Received data is stored here after application reads DFIFO. RX FIFO is shared */
 
-#define CHUNK_SIZE 32768  // 32KB
-uint8_t msc_buffer_0[CHUNK_SIZE] __attribute__((aligned(4)));
-uint8_t msc_buffer_1[CHUNK_SIZE] __attribute__((aligned(4)));
-uint8_t active_buf = 0; // 0 or 1
-
 
 /* Even though the structs are "packed" for the protocol, the starting address of your buffers (like rxBufferEp1) should be 4-byte aligned (word-aligned).
  The STM32's OTG engine performs better (and sometimes only works) when the DMA/FIFO can access data on word boundaries. */
@@ -57,7 +52,7 @@ const uint8_t MSC_InquiryData[] = {
     0x02,          // Response Data Format
     31,            // Additional Length (36 - 5 bytes)
     0x00, 0x00, 0x00, // SCCS, etc.
-    'G', 'e', 'm', 'i', 'n', 'i', ' ', ' ', // Vendor ID (8 chars)
+    'N', 'i', 'c', 'o', 'l', 'a', 's', ' ', // Vendor ID (8 chars)
     'S', 'T', 'M', '3', '2', 'F', '4', ' ', // Product ID (16 chars)
     'D', 'i', 's', 'c', 'o', 'v', 'e', 'r',
     'y', ' ', '1', '.', '0'                 // Revision (4 chars)
@@ -69,17 +64,7 @@ uint8_t msc_sense_key = 0;
 uint8_t msc_asc = 0;
 uint8_t msc_ascq = 0;
 
-//uint8_t *Media_Get_LBA_Pointer(uint32_t lba, uint16_t block_count);
-//uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count);
-//
-//
-//uint8_t *Media_Get_LBA_Pointer(uint32_t lba, uint16_t block_count) {
-//    uint32_t offset = lba * 512;
-//    // For reads, we point directly to the Flash silicon // block_count no longer used
-//    return (uint8_t *)(QSPI_BASE_ADDR + offset);
-//}
-
-/****************************************************************************/
+/*******************************************************************/
 
 static volatile uint32_t device_state = DEVICE_STATE_DEFAULT; /* Device state */
 volatile MSC_State_t msc_state = MSC_STATE_IDLE; // msc_state is tracking where things are in the MSC "Command-Data-Status" loop
@@ -398,7 +383,7 @@ void maintenance_switch(void) {
         QSPI_WaitUntilReady(); // Wait for Flash Ready (the PC might have been writing right when the button was pressed)
         QSPI_Enable_MemoryMapped();
         flag_usb_connected = 0; // Tell the STM32 logic it's safe to work again
-        NBdelay_ms(20);   // Safety Delay: Windows takes a moment to realize the device is gone
+        NBdelay_ms(50);   // Safety Delay: Windows takes a moment to realize the device is gone
     	// Mount the drive - This doesn't "touch" the flash much; it just tells FatFs to initialize the fs structure and prepare for communication.
     	res = f_mount(&fs, "0:", 1); //  "": Defaut Drive (number 0) ; 1: Forced mount (checks for FAT structure immediately)
     	if (res != FR_OK) {	/* If res is FR_NO_FILESYSTEM*/ }
@@ -710,6 +695,7 @@ static MSC_Status_t MSC_Handle_Write10(USB_MSC_CBW_t *cbw) {
 MSC_Status_t MSC_WriteComplete_Callback(void) {
 
 	uint32_t flash_addr = write_lba * 4096;
+	MSC_Status_t write_status = MSC_OK;
 
 	/** ERASE LOGIC **/
 	if (write_lba <= 64) {
@@ -747,16 +733,23 @@ MSC_Status_t MSC_WriteComplete_Callback(void) {
 		USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
 
 		 return MSC_OK; // Exit and wait for the next chunk to arrive
-    }
+	}
+	// CHECK FOR HARDWARE FAILURE (Last possible moment)
+	if (QSPI_GetStatus(0x70) & 0x30) {			 // bits 4 and 5 of Flag status register
+		MSC_Update_Sense_Data(0x03, 0x03, 0x00); // MEDIUM ERROR, SCSI_AS_WRITE_FAULT
+		write_status = MSC_FAIL;
+		MT25Q_SendCommand(0x50); // Clear the flags from status register
+	}
 
-    // DATA PHASE FINISHED (msc_bytes_remaining == 0)
-    is_sector_pre_erased = 0;
+	// DATA PHASE FINISHED (msc_bytes_remaining == 0)
+	is_sector_pre_erased = 0;
     current_32k_block = 0xFFFFFFFF;
     // Re-enable Memory Mapping so the next 'Read' works!
     QSPI_Enable_MemoryMapped();
 
     // Now send the CSW. The Host has finished sending all data and will finally send an IN token for the status.
-    MSC_Send_CSW(msc_tag, 0, 0x00);
+    uint8_t csw_result = (write_status == MSC_FAIL) ? 0x01 : 0x00; // Pass 0x01 if hardware failure was detected
+    MSC_Send_CSW(msc_tag, 0, csw_result);
 
     return MSC_OK;
 }

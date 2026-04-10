@@ -1,13 +1,22 @@
-/*********************************************************/
-/* Bare-Metal USB MSC + QSPI Flash MT25QL128
- *
- * Working example 				*/
-/* Main Functions: 				*/
-/* readID, MT25Q_SubsectorErase, MT25Q_SubsectorRead, MT25Q_PageProgram, MT25Q_SubsectorWrite */
-/* DMA for Indirect sub-sector Read (4KB) 	***/
-/* Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()		*/
-/* Nicolas Prata 2026	- // 0x90000000							   ***/
-/*********************************************************/
+/**********************************************************************************
+* Bare-Metal USB OTG FS device Mass Storage (MSC) implementation
+*  Working example
+*
+* Main Functions:
+*
+* DMA for Indirect sub-sector Read (4KB)
+* Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()
+*  Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()
+*  Press PA0 Button to enable/disable the USB (Flash drive will appear on Windows)
+*
+* Lightweight, only two MSC files to integrate to your project: usb_msc_fs.c and usb_msc_fs.h
+* Usage:
+    - You can edit the descriptors on usb_MSC_fs.h file
+    - USB Slave-mode only (DMA not available on USB Full Speed with PA11 - PA12)
+* Added support for on-board QSPI Flash MT25QL128 and the FATfs library
+* Format to exFAT (32KB alloc size is faster for large transfers but for small files keep 4096KB)
+* Nicolas Prata - 2026
+**********************************************************************************/
 
 #include <stdio.h>
 #include "stm32f469xx.h"
@@ -17,22 +26,23 @@
 #include "myConfig.h"
 #include "timers.h"
 #include "diskio.h" 	// FatFs driver wrappers
+#include "ff_func.h" 	// a few homemade FATfs functions
 #include "uart3.h"
-#include "ff_func.h" 	// homemage FATfs functions
 
-uint32_t first_byte;
 uint32_t uid;
 uint8_t flag = 0;
+
+/* If you want to use FATfs, you need to register the work area of the volume */
 FATFS fs; // Pointer to the filesystem object (The "Drive" instance)
 
 volatile uint32_t TicksMs = 0;    // Stores the timestamp of the initial push
 volatile uint8_t  was_long_press = 0;
 volatile uint8_t pushed = 0;      // Tracks the physical state (1=Down, 0=Up)
+// Memory-Mapped Start address: 0x90000000
 
 int main (void)
 {
 	/** Initialization functions **/
-
 	activateFPU();
 	SysClockConfig();
 	GPIO_Config();
@@ -44,7 +54,7 @@ int main (void)
 	QSPI_Hardware_Init();     // 2. Now that the "heartbeat" is stable at 180MHz...
 	QSPI_Flash_Reset();
 
-	BareM_StatusTypeDef Ut_s = Uart3_Init(&huart3, 115200);
+	BareM_StatusTypeDef Ut_s = Uart3_Init(&huart3, 115200); // Init UART3
 	while(Ut_s != Bare_OK);
 
 	uid = readID();
@@ -54,21 +64,22 @@ int main (void)
 
 	USB_OTG_DEVICE->DCTL |= USB_OTG_DCTL_SDIS;  // disable USB at startup - to enable press button PA0
 
-	NBdelay_ms(1500);
+	NBdelay_ms(50); // safety delay
 
 	FRESULT res;  // Check if operations succeed
 	res = f_mount(&fs, "0:", 1); //  "": Defaut Drive (number 0) ; 1: Forced mount (checks for FAT structure immediately)
 	if (res != FR_OK) {	GPIOG->ODR^=GPIO_ODR_OD6; /* If res is FR_NO_FILESYSTEM*/ }
 	NBdelay_ms(100);
+
 //	append_to_file((char *)"example.txt", ((char *)"\r\nI wanna dance with somebody.\r\n"));
 //	disp_lines((char *)"example.txt");
 //	list_dir((char *)"number1");
 
-	 // MT25Q_BulkErase();
-	//	res = f_mkdir("number1");
-	//	if (res == FR_OK) {	GPIOD->ODR^=GPIO_ODR_OD4; }
+	 // MT25Q_BulkErase(); // format the Flash with 0xFF (Windows formats with 0x00)
 
 	while (1) {
+
+		// switch USB on/off
 		if (was_long_press) {
 			NBdelay_ms(50);  // avoid debouncing
 		    maintenance_switch();

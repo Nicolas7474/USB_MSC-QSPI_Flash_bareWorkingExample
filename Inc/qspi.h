@@ -14,12 +14,15 @@ void QSPI_Flash_Reset(void);
 void QSPI_Enable_MemoryMapped(void);
 void QSPI_WriteEnable(void);
 void QSPI_EnableQuadMode(void);
-uint8_t QSPI_GetStatus(void);
+uint8_t QSPI_GetStatus(uint8_t instruction);
 void QSPI_WaitUntilReady(void);
+void QSPI_Prepare_Indirect(void);
 uint32_t readID(void);
+
 void MT25Q_SubsectorRead(uint32_t address, uint8_t *rData);
 void MT25Q_SubsectorErase_4KB(uint32_t address);
 void MT25Q_SubsectorErase_32KB(uint32_t address);
 void MT25Q_SubsectorWrite_4KB(uint32_t address, uint8_t *data);
-void QSPI_Prepare_Indirect(void);
 void MT25Q_BulkErase(void);
+void MT25Q_SendCommand(uint8_t instruction);
+uint8_t MT25Q_Check_Hardware_Success(void);

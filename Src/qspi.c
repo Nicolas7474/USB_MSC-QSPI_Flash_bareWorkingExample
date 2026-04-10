@@ -74,6 +74,13 @@ void QSPI_Hardware_Init(void) {
 	// SSHIFT = 1    -> Sample on the half-cycle (Critical for 90MHz) - allows the data to be sampled later
 	QUADSPI->CR = (2U << QUADSPI_CR_PRESCALER_Pos) | QUADSPI_CR_SSHIFT | QUADSPI_CR_EN; // CR Configuration
 
+	// Autopolling Mode: Set the match value and mask
+	QUADSPI->PSMAR = 0x00; // We want the bit to be 0
+	QUADSPI->PSMKR = 0x01; // We only care about Bit 0 (WIP)
+	// Set polling interval (how often the hardware checks)
+	// This value defines how many CLK cycles to wait between polls
+	QUADSPI->PIR = 0x4000; // T = 1/(QSPI clock /  QUADSPI->PIR)
+
 	QSPI_DMA_Global_Init(); // Call to configure DMA
 }
 
@@ -182,7 +189,7 @@ void QSPI_EnableQuadMode(void) {
 }
 
 
-uint8_t QSPI_GetStatus(void) {
+uint8_t QSPI_GetStatus(uint8_t instruction) {
 
 	uint32_t timeout = 0;
 	QSPI_Prepare_Indirect();
@@ -195,9 +202,13 @@ uint8_t QSPI_GetStatus(void) {
 	QUADSPI->CCR = (1U << QUADSPI_CCR_FMODE_Pos) | // Functional mode: Indirect-read mode
 			(3U << QUADSPI_CCR_DMODE_Pos) | 	   // We are in Quad mode
 			(3U << QUADSPI_CCR_IMODE_Pos) |
-			(0x05U << QUADSPI_CCR_INSTRUCTION_Pos); // Read MT25QL128 Status Register (can be read continuously and at any time)
-
-	while (!(QUADSPI->SR & QUADSPI_SR_TCF));
+			((uint32_t)instruction << QUADSPI_CCR_INSTRUCTION_Pos); // 0x05 = Read MT25QL128 Status Register (can be read continuously and at any time)
+																	// 0x70 = Read Flag Status Register
+	timeout = 0;
+	while (!(QUADSPI->SR & QUADSPI_SR_TCF)) {
+		timeout++;
+		if (timeout > 500000) return -1;
+	}
 	uint8_t status = (uint8_t)(QUADSPI->DR);
 	QUADSPI->FCR = QUADSPI_FCR_CTCF;
 
@@ -208,7 +219,7 @@ void QSPI_WaitUntilReady(void) {
 	// for MT25Q_SubsectorErase_4KB() env. 30ms of polling (0x05)
 	// Bit 0 of Status Register is WIP (Write In Progress)
 	QSPI_Prepare_Indirect(); // necessary to poll (QUADSPI->SR & QUADSPI_SR_BUSY)
-	while (QSPI_GetStatus() & 0x01); // bit 1 = "Write in progress" of MT25QL128 "Read Status Register"
+	while (QSPI_GetStatus(0x05) & 0x01); // bit 1 = "Write in progress" of MT25QL128 "Read Status Register"
 }
 
 
@@ -433,31 +444,43 @@ void MT25Q_SubsectorWrite_4KB(uint32_t address, uint8_t *data) {
 static void QSPI_AutoPollingMode(void) {
 	// Use Automatic Status-polling Mode only inside Erase functions (big process time)
 
-	// 1. Set the match value and mask
-	QUADSPI->PSMAR = 0x00; // We want the bit to be 0
-	QUADSPI->PSMKR = 0x01; // We only care about Bit 0 (WIP)
-
-	// 2. Set polling interval (how often the hardware checks)
-	// This value defines how many CLK cycles to wait between polls
-	QUADSPI->PIR = 0x4000; // T = 1/(QSPI clock /  QUADSPI->PIR)
-
-	// 3. Configure the Control Register (CR)
+	// Configure the Control Register (CR)
 	// PMM = 0 (Bit 23): Match is found if ANY polling read matches
 	// APMS = 1 (Bit 22): STOP polling as soon as a match is found (saves power/bus)
 	// SMIE = 1 (Bit 19): Interrupt Enable - trigger the IRQ when SMF is set
-	QUADSPI->CR |= QUADSPI_CR_APMS | QUADSPI_CR_SMIE;
+	QUADSPI->CR |= QUADSPI_CR_APMS; // interrupt QUADSPI_CR_SMIE not enabled
 
-	// 3. Configure CCR for Auto-Polling
+	// Configure CCR for Auto-Polling
 	QUADSPI->CCR = (2U << QUADSPI_CCR_FMODE_Pos) | // 10: Automatic polling mode
 			(3U << QUADSPI_CCR_DMODE_Pos) | // Quad Data
 			(3U << QUADSPI_CCR_IMODE_Pos) | // Quad Instruction
 			(0x05U << QUADSPI_CCR_INSTRUCTION_Pos);
 
-	// 4. Wait for SMF (Status Match Flag) or enable the interrupt
+	// Wait for SMF (Status Match Flag) or enable the interrupt
 	while (!(QUADSPI->SR & QUADSPI_SR_SMF));
 
-	// 5. Clear flag and move on
-	QUADSPI->FCR = QUADSPI_FCR_CSMF;
+	QUADSPI->FCR = QUADSPI_FCR_CSMF; 	// Clear flag and move on
 }
 
 
+void MT25Q_SendCommand(uint8_t instruction) {
+    uint32_t timeout = 0;
+
+    // 1. Wait for Busy to clear
+    QSPI_Prepare_Indirect();
+    while (QUADSPI->SR & QUADSPI_SR_BUSY) {
+        timeout++;
+        if (timeout > 500000) return;
+    }
+
+    // 2. Configure for Instruction-Only (No Address, No Data)
+    QUADSPI->DLR = 0; // incase
+    QUADSPI->CCR = (0U << QUADSPI_CCR_FMODE_Pos) |   // Functional Mode: 0 (Indirect Write)
+                   (0U << QUADSPI_CCR_DMODE_Pos) |   // Data Mode: 0 (No Data)
+                   (3U << QUADSPI_CCR_IMODE_Pos) |
+                   ((uint32_t)instruction << QUADSPI_CCR_INSTRUCTION_Pos);
+
+    // 3. Wait for Transfer Complete
+    while (!(QUADSPI->SR & QUADSPI_SR_TCF));
+    QUADSPI->FCR = QUADSPI_FCR_CTCF;
+}
