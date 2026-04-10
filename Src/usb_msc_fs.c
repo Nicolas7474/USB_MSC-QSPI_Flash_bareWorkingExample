@@ -9,11 +9,6 @@
 * Format to exFAT (32KB alloc size is faster for large transfers but for small files keep 4096KB)
 ******************************************************************************************************/
 
-/*	WORK IN PROGRESS.
-    IMPROVE TRANSFER SPEED, VERY SLOW (AUTOPOLLING OF ERASE BLOCKING -> ADD INTERRUPTS)
-	CODE TO CLEAN AND ORDER. MUST IMPROVE ROBUSTNESS. CHECK AND CREATE MORE FATfs FUNCTIONS.
-*/
-
 #include "stm32f4xx.h"
 #include "stm32f469xx.h"
 #include "main.h"

@@ -18,6 +18,11 @@
 * Nicolas Prata - 2026
 **********************************************************************************/
 
+/*	WORK IN PROGRESS.
+    IMPROVE TRANSFER SPEED, VERY SLOW (AUTOPOLLING OF ERASE BLOCKING -> ADD INTERRUPTS)
+	CODE TO CLEAN AND ORDER. MUST IMPROVE ROBUSTNESS. CHECK AND CREATE MORE FATfs FUNCTIONS.
+*/
+
 #include <stdio.h>
 #include "stm32f469xx.h"
 #include "main.h"
