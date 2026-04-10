@@ -347,11 +347,8 @@ int Irq_dma (UART_DMA_Handle *huartTx) {
 	else if(huartTx->DMA_Stream == DMA1_Stream5 ) { dmaStream = DMA1_Stream5_IRQn; }
 	else if(huartTx->DMA_Stream == DMA1_Stream6 ) { dmaStream = DMA1_Stream6_IRQn; }
 	else if(huartTx->DMA_Stream == DMA1_Stream7 ) { dmaStream = DMA1_Stream7_IRQn; }
-	else if(huartTx->DMA_Stream == DMA2_Stream0 ) { dmaStream = DMA2_Stream0_IRQn; }
 	else if(huartTx->DMA_Stream == DMA2_Stream1 ) { dmaStream = DMA2_Stream1_IRQn; }
 	else if(huartTx->DMA_Stream == DMA2_Stream2 ) { dmaStream = DMA2_Stream2_IRQn; }
-	else if(huartTx->DMA_Stream == DMA2_Stream3 ) { dmaStream = DMA2_Stream3_IRQn; }
-	else if(huartTx->DMA_Stream == DMA2_Stream4 ) { dmaStream = DMA2_Stream4_IRQn; }
 	else if(huartTx->DMA_Stream == DMA2_Stream5 ) { dmaStream = DMA2_Stream5_IRQn; }
 	else if(huartTx->DMA_Stream == DMA2_Stream6 ) { dmaStream = DMA2_Stream6_IRQn; }
 	else if(huartTx->DMA_Stream == DMA2_Stream7 ) { dmaStream = DMA2_Stream7_IRQn; }

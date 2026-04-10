@@ -61,7 +61,6 @@ int main (void)
 	if(uid != 0x18BA20) return -1; // don't start if the correct Flash ID isn't read
 	QSPI_EnableQuadMode(); // comment to stay on SPI extended (1-1-1)
 
-
 	USB_OTG_DEVICE->DCTL |= USB_OTG_DCTL_SDIS;  // disable USB at startup - to enable press button PA0
 
 	NBdelay_ms(50); // safety delay
@@ -71,9 +70,9 @@ int main (void)
 	if (res != FR_OK) {	GPIOG->ODR^=GPIO_ODR_OD6; /* If res is FR_NO_FILESYSTEM*/ }
 	NBdelay_ms(1000);
 
-	append_to_file((char *)"example.txt", ((char *)"\r\nI wanna dance with somebody.\r\n"));
-	disp_lines((char *)"example.txt");
-	list_dir((char *)"number1");
+//	append_to_file((char *)"example.txt", ((char *)"\r\nI wanna dance with somebody.\r\n"));
+//	disp_lines((char *)"example.txt");
+//	list_dir((char *)"number1");
 
 	 // MT25Q_BulkErase(); // format the Flash with 0xFF (Windows formats with 0x00)
 
