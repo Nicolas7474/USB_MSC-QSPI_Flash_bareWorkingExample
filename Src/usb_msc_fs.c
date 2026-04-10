@@ -1,5 +1,5 @@
 /****************************************************************************************************
-* STM32F469
+* STM32F469 - USB MSC Driver
 * USB OTG FS device Mass Storage (MSC) implementation  - Nicolas Prata - 2026
 * Lightweight, only two MSC files to integrate to your project: usb_msc_fs.c and usb_msc_fs.h
 * Usage:
@@ -9,45 +9,44 @@
 * Format to exFAT (32KB alloc size is faster for large transfers but for small files keep 4096KB)
 ******************************************************************************************************/
 
-#include "stm32f4xx.h"
-#include "stm32f469xx.h"
 #include "main.h"
 #include "usb_msc_fs.h"
 #include "qspi.h"
-#include "ff.h" // only needed for f_mount() function
 #include "timers.h"
 
-uint8_t chk = 0;
-uint8_t asked = 0;
-uint8_t write_buf[4096];
+static volatile uint32_t device_state = DEVICE_STATE_DEFAULT; /* Device state */
+volatile MSC_State_t msc_state = MSC_STATE_IDLE; // msc_state is tracking where things are in the MSC "Command-Data-Status" loop
+
+volatile static USB_setup_req_data setup_pkt_data; /* Setup Packet var */
+EndPointStruct EndPoint[EP_COUNT];	/* All the Enpoints are included in this array */
+
+// Global variables to track the USB enable
 volatile uint8_t flag_fatfs_busy = 0;
 volatile uint8_t flag_usb_connected;
 
-/* RX buffers for Endpoint structure*/
-#define RX_BUFFER_EP0_SIZE 64U // 8 is normally enough but 64 costs almost nothing in RAM and can prevent the most common USB crashes
-#define STORAGE_SIZE (1024 * 32) // 32KB RAM Disk
-#define QSPI_BASE_ADDR 0x90000000 // Memory-Mapped Flash
+// Global variables to track the write progress
+uint32_t write_lba;
+uint16_t write_block_count;
+uint32_t msc_tag = 0; // Save the tag from the CBW here
+static uint32_t msc_bytes_remaining = 0;
+static uint8_t is_sector_pre_erased = 0; // Track if the current multi-block transfer already performed a 64KB erase
+static uint32_t current_32k_block = 0xFFFFFFFF;
 
-// Stores incoming SCSI commands (31 bytes) and incoming data from PC (WRITE_10). A standard SCSI sector is 512 bytes
-#define RX_BUFFER_EP1_SIZE (1024 * 32) // -> 32KB (out of 384 KB of system RAM) improves the performance, Windows can send 16 sectors without interrupts.
+// Global or static variables to hold current error state
+uint8_t msc_sense_key = 0;
+uint8_t msc_asc = 0;
+uint8_t msc_ascq = 0;
+
+uint8_t write_buf[4096];
 static uint8_t rxBufferEp0[RX_BUFFER_EP0_SIZE]; /* Received data is stored here after application reads DFIFO. RX FIFO is shared */
-
-
-/* Even though the structs are "packed" for the protocol, the starting address of your buffers (like rxBufferEp1) should be 4-byte aligned (word-aligned).
- The STM32's OTG engine performs better (and sometimes only works) when the DMA/FIFO can access data on word boundaries. */
-__attribute__ ((aligned (4))) uint8_t rxBufferEp1[RX_BUFFER_EP1_SIZE];
-
+__attribute__ ((aligned (4))) uint8_t rxBufferEp1[RX_BUFFER_EP1_SIZE]; // Word-aligned: The OTG engine performs better when the DMA/FIFO can access data on word boundaries
 
 /*
  Standard Inquiry Data (always 36 bytes). This data is crucial for the USB Host to identify the device type,
  vendor, product, and revision, enabling it to load the appropriate driver and map the device as a removable disk. */
 const uint8_t MSC_InquiryData[] = {
-	/* Use RMB = 0x00 only if your device behaves like a fixed disk, e.g.: Embedded system exposing internal flash as a stable drive, device that is never
-	  unplugged during operation, implemented with synchronized cache, robust write handling, power-loss safety. Otherwise, it can cause subtle host-side issues.
-	  Embedded MSC devices → almost always 0x80
-	*/
 	0x00,          // Direct Access Block Device (Flash Drive / Hard Drive)
-    0x80,          // 0x80: RMB = 1 (Removable Medium), 0x00: "Fixed" disk like an internal SSD (less polling TEST_UNIT_READY but overlaps packets, doesnt work)
+    0x80,          // 0x80: RMB = 1 (Removable Medium). Embedded MSC devices → almost always 0x80. Use RMB = 0x00 only if the device behaves like a fixed disk
     0x02,          // Version (ANSI SPC-3)
     0x02,          // Response Data Format
     31,            // Additional Length (36 - 5 bytes)
@@ -57,29 +56,6 @@ const uint8_t MSC_InquiryData[] = {
     'D', 'i', 's', 'c', 'o', 'v', 'e', 'r',
     'y', ' ', '1', '.', '0'                 // Revision (4 chars)
 };
-
-
-// Global or static variables to hold current error state
-uint8_t msc_sense_key = 0;
-uint8_t msc_asc = 0;
-uint8_t msc_ascq = 0;
-
-/*******************************************************************/
-
-static volatile uint32_t device_state = DEVICE_STATE_DEFAULT; /* Device state */
-volatile MSC_State_t msc_state = MSC_STATE_IDLE; // msc_state is tracking where things are in the MSC "Command-Data-Status" loop
-
-volatile static USB_setup_req_data setup_pkt_data; /* Setup Packet var */
-
-EndPointStruct EndPoint[EP_COUNT];	/* All the Enpoints are included in this array */
-
-// Global variables to track the write progress
-uint32_t write_lba;
-uint16_t write_block_count;
-uint32_t msc_tag = 0; // Save the tag from the CBW here
-static uint32_t msc_bytes_remaining = 0;
-static uint8_t is_sector_pre_erased = 0; // Track if the current multi-block transfer already performed a 64KB erase
-static uint32_t current_32k_block = 0xFFFFFFFF;
 
 /****************************************************************
  * 		static functions' declarations
@@ -334,13 +310,10 @@ static void activate_Endpoints(void) {
     USB_EP_OUT(1)->DOEPCTL |= (USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_EPENA);
 }
 
-/**
-* brief  Set RX and TX FIFO size and offset for each EP
-* param
-* param
-* retval
-*/
+
 static inline void set_FIFOs_sz(){
+	/*Set RX and TX FIFO size and offset for each EP*/
+
 	USB_OTG_FS->GRXFSIZ = RX_FIFO_SIZE; // all EPs RX FIFO RAM size (GRXFSIZ) OTG receive FIFO size register)
 
 	/* OTG Host Non-Periodic Transmit FIFO Size register - EP0 TX FIFO RAM size (Start: 128, Size: 64) */
@@ -400,9 +373,7 @@ static void Get_ID_To_String(uint8_t *dest) {
 
 	uint8_t *pStr = &dest[2];  // Start writing at the 3rd byte (after the header)
 
-
-	// Convert 12 bytes of raw ID to 24 Unicode characters
-	// Process 3 words (12 bytes total)
+	// Convert 12 bytes of raw ID to 24 Unicode characters - process 3 words (12 bytes total)
 	for (int i = 0; i < 3; i++) {
 		uint32_t word = id_ptr[i];
 		// Process each word byte-by-byte (4 bytes per word)
@@ -427,40 +398,8 @@ static void Get_ID_To_String(uint8_t *dest) {
 The flow is a strict loop: Data Phase: The Host asks for X bytes (e.g., 4096).  Status Phase: You send exactly 13 bytes (the CSW).
 Receive 31 bytes (CBW) on OUT, Send/Receive Data (Optional) on IN or OUT, Send 13 bytes (CSW) on IN.
 If you skip any of these or send them out of order, the PC will show the dreaded "USB Device Not Recognized."
-
-Think of SCSI Inquiry as the "Business Card" of your storage device.
-When you plug a USB drive into a PC, the OS doesn't know if it's a CD-ROM, a Hard Drive, or a Tape Drive. It sends the INQUIRY command to ask:
-    What are you? (Direct Access Block Device, CD-ROM, etc.)
-    Are you removable? (SD cards are, internal fixed SSDs aren't).
-    Who made you? (Vendor ID: "STMicro", "Kingston", "Gemini").
-    What model are you? (Product ID: "STM32-Disk").
-If you don't answer this correctly, the PC won't even try to read sectors; it will just label the device as "Unknown."
-
-When you plug the USB into your PC:
-    PC: INQUIRY -> You: "I am an STM32 Disk."
-    PC: READ_CAPACITY_10 -> You: "I have X blocks of 4096 bytes."
-    PC: TEST_UNIT_READY -> You: "Yes, I'm here."
-    PC: MODE_SENSE_6 -> You: "I am not write-protected."
-    PC: READ_10 (LBA 0) -> You: Sends the Boot Sector/Partition Table.
-    Windows: "Aha! I see a FAT32 file system. Displaying drive letter G:/"
-
-The dTag is a "serial number" for the transaction. The PC might send a READ_10 with tag 0x12345678. When you finish sending the 4096 bytes of data,
-you must send the CSW with that exact same tag. If the tags don't match, Windows will assume a "Phase Error" and reset the whole USB connection.
-
 If a FIFO error occurs, the hardware sets a bit in DIEPINT, and we usually just STALL the endpoint. A software state bit isn't enough to recover.
  */
-
-//uint32_t Media_Write_Block(uint32_t lba, uint8_t *buffer, uint32_t block_count) { // pas utile ????
-//    uint32_t offset = lba * 512;
-//
-//    if (offset + (block_count * 512) <= STORAGE_SIZE) {
-//        // Just copy from USB buffer to our internal RAM "disk"
-//        //memcpy(&ram_disk[offset], buffer, block_count * 512);
-//        return 0; // Success
-//    }
-//    return 1; // Error
-//}
-
 
 static MSC_Status_t MSC_Parse_SCSI_Command(USB_MSC_CBW_t *cbw) {
 	uint8_t opcode = cbw->CB[0];
@@ -471,7 +410,7 @@ static MSC_Status_t MSC_Parse_SCSI_Command(USB_MSC_CBW_t *cbw) {
 		break;
 
 	case 0x12: // INQUIRY
-		MSC_Handle_Inquiry(cbw);
+		MSC_Handle_Inquiry(cbw); // Reply essential device informations (type, removable, vendor, etc)
 		break;
 
 	case 0x43: // READ TOC
@@ -1042,12 +981,6 @@ static void MSC_ForceResetState(void) {
 * 				DFIFO
 ***************************************************/
 
-/**
-* brief  Flush TxFifo
-* param  Fifo number, 10 = all Tx Fifos,
-* param  timeout (default FLUSH_FIFO_TIMEOUT)
-* retval 1 = OK, 0 = Failed
-*/
 uint32_t USB_FlushTxFifo(uint32_t EPnum, uint32_t timeout){
 	uint32_t count = 0;
 	USB_OTG_FS->GRSTCTL = (USB_OTG_GRSTCTL_TXFFLSH | (EPnum << 6));
@@ -1061,11 +994,6 @@ uint32_t USB_FlushTxFifo(uint32_t EPnum, uint32_t timeout){
 	 return EP_OK;
 }
 
-/**
-* brief  Flush RxFifo
-* param  timeout (default FLUSH_FIFO_TIMEOUT)
-* retval 1 = OK, 0 = Failed
-*/
 uint32_t USB_FlushRxFifo(uint32_t timeout){
 	uint32_t count = 0;
 	USB_OTG_FS->GRSTCTL = USB_OTG_GRSTCTL_RXFFLSH;
@@ -1078,28 +1006,19 @@ uint32_t USB_FlushRxFifo(uint32_t timeout){
 
 	return EP_OK;
 }
-/**
-* brief  Read Setup Packet EP0
-* param
-* param
-* retval
-*/
+
 void read_Setup_Fifo(){
-	/* Read Setup packet. Always 8 bytes (2 words) from the FIFO*/
+	/*  Read Setup Packet EP0. Always 8 bytes (2 words) from the FIFO */
 	uint32_t first_word = USB_OTG_DFIFO(0);
 	uint32_t second_word = USB_OTG_DFIFO(0);
 
-	setup_pkt_data.raw_data[0] = first_word;
+	setup_pkt_data.raw_data[0] = first_word; //
 	setup_pkt_data.raw_data[1] = second_word;
 }
 
-/**
- * brief  Read data from DFIFO (into rxBufferMain[RX_BUFFER_MAIN_SIZE] for EP1)
- * brief  If you don't handle recieved data on OEPINT event, there is a risk that the data will be lost
- * param  EP number, length
- * retval
- */
 void read_Fifo(uint8_t dfifo, uint16_t len) {
+	// Handle immediately received data on OEPINT event
+
     uint32_t word_count = (len + 3) >> 2;
     // Use the pointer EXACTLY as it is currently set in the EndPoint struct
     uint8_t *dest = EndPoint[dfifo].rxBuffer_ptr;
@@ -1118,18 +1037,10 @@ void read_Fifo(uint8_t dfifo, uint16_t len) {
         }
     }
 
-    // Update the pointer so the NEXT packet in this transfer
-    // (e.g. the 2nd packet of a 4096-byte block) lands in the right place
-    EndPoint[dfifo].rxBuffer_ptr = dest;
-    EndPoint[dfifo].rxCounter += len;
+    EndPoint[dfifo].rxBuffer_ptr = dest;   // Update the pointer so the NEXT packet in this transfer
+    EndPoint[dfifo].rxCounter += len;     // (e.g. the 2nd packet of a 4096-byte block) lands in the right place
 }
 
-/**
-* brief  Write data into DFIFO
-* param  EP number, TX Buffer, length
-* param
-* retval OK or FAILED (in case DFIFO overrun, for better details watch my youtube)
-*/
 uint32_t write_Fifo(uint8_t dfifo, uint8_t *src, uint16_t len) {
     uint32_t word_count = (len + 3) >> 2;
 

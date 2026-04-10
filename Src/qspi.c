@@ -1,20 +1,14 @@
 /*********************************************************/
 /*   Bare-Metal USB MSC + QSPI Flash MT25QL128
- *
- * Working example -  Main Functions: 			***/
-/*			*/
-/* readID, MT25Q_SubsectorErase, MT25Q_SubsectorRead, MT25Q_PageProgram, MT25Q_SubsectorWrite */
-/** 	***/
-/*	 Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()		*/
-/* 	 Nicolas Prata 2026								   ***/
+ *   QSPI driver
+ * 	 Working example  										*/
+/*														    */
+/*	 Enable Memory-Mapped mode: QSPI_Enable_MemoryMapped()  */
+/* 	 Nicolas Prata 2026								   	   */
 /*********************************************************/
 
-#include "stm32f4xx.h"
-#include "stm32f469xx.h"
-#include "main.h"
-#include "qspi.h"
 #include "timers.h"
-
+#include "qspi.h"
 
 static void QSPI_DMA_Global_Init(void);
 static void QSPI_AutoPollingMode(void);
@@ -131,7 +125,7 @@ void QSPI_Enable_MemoryMapped(void) {
 			(3U  << QUADSPI_CCR_IMODE_Pos)  | // Instruction 4 lines
 			(0x6BU << QUADSPI_CCR_INSTRUCTION_Pos); // Opcode 0x6B (QUAD OUTPUT FAST READ)
 	/*   Once the QSPI is in Memory-Mapped mode, the QUADSPI->DR register is no longer used,
-		and you cannot send manual commands like readID() without first switching FMODE back to 0 or 1 */
+		and you cannot send manual commands like MT25Q_readID() without first switching FMODE back to 0 or 1 */
 }
 
 void QSPI_Prepare_Indirect(void) {
@@ -223,7 +217,7 @@ void QSPI_WaitUntilReady(void) {
 }
 
 
-uint32_t readID(void) {
+uint32_t MT25Q_readID(void) {
 	// Manufacturer ID=0x20 JEDEC, Memory type=0xBA (3V), Memory capacity=18h (128Mb)
 	QSPI_Prepare_Indirect();
 	uint32_t id = 0;
@@ -422,9 +416,6 @@ void MT25Q_PageProgram(uint32_t address, uint8_t *pData) {
 	// Clear Transfer Complete Flag
 	QUADSPI->FCR = QUADSPI_FCR_CTCF;
 
-	// 6. Final Busy check
-	//  while (QUADSPI->SR & QUADSPI_SR_BUSY);
-
 	// Crucial: Wait for the Flash to actually finish burning the bits
 	QSPI_WaitUntilReady();
 }
@@ -447,7 +438,7 @@ static void QSPI_AutoPollingMode(void) {
 	// Configure the Control Register (CR)
 	// PMM = 0 (Bit 23): Match is found if ANY polling read matches
 	// APMS = 1 (Bit 22): STOP polling as soon as a match is found (saves power/bus)
-	// SMIE = 1 (Bit 19): Interrupt Enable - trigger the IRQ when SMF is set
+	// SMIE = 0 (Bit 19): Interrupt Enable - trigger the IRQ when SMF is set
 	QUADSPI->CR |= QUADSPI_CR_APMS; // interrupt QUADSPI_CR_SMIE not enabled
 
 	// Configure CCR for Auto-Polling

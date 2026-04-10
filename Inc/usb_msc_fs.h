@@ -65,13 +65,17 @@ USB_OTG_PCGCCTLTypeDef;
 #define EP1_MIN_DTFXSTS_LVL		16		/* Minimum TX FIFO empty level */
 
 #define MAX_MSC_EP0_TX_SIZ  	64    /* Max TX transaction size for EP0. "64" means that you can send maximum one packet of max size
-in TXCallback, then you send the rest bytes (or ZLP) in next function call. Max USB_OTG_DIEPTSIZ_XFRSIZ value.     */
-#define MAX_MSC_EP1_TX_SIZ  	128   /* Max TX transaction size for EP1.  Max USB_OTG_DIEPTSIZ_XFRSIZ value.      */
+						in TXCallback, then you send the rest bytes (or ZLP) in next function call. Max USB_OTG_DIEPTSIZ_XFRSIZ value.*/
+#define MAX_MSC_EP1_TX_SIZ  	128   /* Max TX transaction size for EP1.  Max USB_OTG_DIEPTSIZ_XFRSIZ value. */
 
 
 #define DOEPT_TRANSFER_SIZE		0x40	// = 64 ; don't use higher values for transfer size/packets nb, Rx speed will be a few % slower !
 #define DOEPT_TRANSFER_PCT 		0x01	// Value used in DOEPTSIZ for EP0 and EP1
+#define RX_BUFFER_EP0_SIZE 64U // 8 is normally enough but 64 costs almost nothing in RAM and can prevent the most common USB crashes
+// Stores incoming SCSI commands (31 bytes) and incoming data from PC (WRITE_10)
+#define RX_BUFFER_EP1_SIZE (1024 * 32) // -> 32KB (out of 384 KB of system RAM) improves the performance, Windows can send 16 sectors without interrupts.
 
+#define QSPI_BASE_ADDR 0x90000000 // Memory-Mapped Flash
 
 /***************************************************
  * 			EP statuses
@@ -111,7 +115,7 @@ typedef enum {
 // __attribute__((packed)) qualifier ensure the compiler doesn't add padding between the fields
 typedef struct __attribute__((packed)) {
     uint32_t dSignature;          // 4 Bytes - "USBC" (0x43425355) - Windows uses this signature to uniquely identify a disk
-    uint32_t dTag;                // 4 Bytes - Unique ID sent by host, must be echoed in CSW
+    uint32_t dTag;                // 4 Bytes - Unique ID sent by host, must be echoed back in CSW. If the tags don't match, gives "Error"
     uint32_t dDataTransferLength; // 4 Bytes - Number of bytes host expects to transfer
     uint8_t  bmFlags;             // 1 Byte -Bit 7: 0=Out (Host to Dev), 1=In (Dev to Host)
     uint8_t  bLUN;                // 1 Byte - Logical Unit Number (usually 0)
@@ -138,7 +142,6 @@ typedef enum {
     MSC_OK = 0,
     MSC_FAIL = 1
 } MSC_Status_t;
-
 
 /***************************************************
  * 			SETUP stage request templates
@@ -276,7 +279,6 @@ and the host controller will flag a "babble" error or a PID sequence error.*/
 #define DEVICE_QUALIFIER_LENGTH			10
 #define INTERFACE_STRING_LENGTH			28
 #define CONFIG_STRING_LENGTH			22
-#define MSC_LINE_CODING_LENGTH			7
 
 #define MSC_GET_MAX_LUN                  0xFEA1
 #define MSC_BOT_RESET                    0xFF21  // Host-to-Device, Class, Interface

@@ -1,4 +1,5 @@
 #include <stm32f469xx.h>
+#include "stm32f4xx.h"
 
 void SysClockConfig (void);
 

@@ -1,38 +1,42 @@
 /**********************************************************************************
 * Bare-Metal USB OTG FS device Mass Storage (MSC) implementation
-*  Working example
+* ----------------------------------------------------------------
+* Working example --- Nicolas Prata - 04/2026
 *
-* Main Functions:
+* Lightweight, only two MSC files to integrate: usb_msc_fs.c and usb_msc_fs.h
+* Notes:
+  - You can edit the descriptors on usb_MSC_fs.h file
+  - USB Slave-mode only (DMA not available on USB Full Speed with PA11 - PA12)
+* - Added support for on-board QSPI Flash MT25QL128 with the FATfs library
+* - Format to exFAT (32KB alloc size is faster for large transfers but for small files keep 4096KB)
+* - DMA for Indirect sub-sector Read (4KB)
+* - Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()
+* - PA0 "Maintenance Button" enable/disable the USB to avoid conflicts (exclusive ownership)
+* - Declare FATFS fs; to have a FATfs working area
 *
-* DMA for Indirect sub-sector Read (4KB)
-* Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()
-*  Enable Memory-Mapped mode (read only) with QSPI_Enable_MemoryMapped()
-*  Press PA0 Button to enable/disable the USB (Flash drive will appear on Windows)
+*--------------------------------------------------------------------------------------
+* For now all FATfs functions must be used along with USB status management (flags)
+* see examples on ff_funct.c
+*--------------------------------------------------------------------------------------
 *
-* Lightweight, only two MSC files to integrate to your project: usb_msc_fs.c and usb_msc_fs.h
-* Usage:
-    - You can edit the descriptors on usb_MSC_fs.h file
-    - USB Slave-mode only (DMA not available on USB Full Speed with PA11 - PA12)
-* Added support for on-board QSPI Flash MT25QL128 and the FATfs library
-* Format to exFAT (32KB alloc size is faster for large transfers but for small files keep 4096KB)
-* Nicolas Prata - 2026
 **********************************************************************************/
-
 /*	WORK IN PROGRESS.
-    IMPROVE TRANSFER SPEED, VERY SLOW (AUTOPOLLING OF ERASE BLOCKING -> ADD INTERRUPTS)
-	CODE TO CLEAN AND ORDER. MUST IMPROVE ROBUSTNESS. CHECK AND CREATE MORE FATfs FUNCTIONS.
+    IMPROVE TRANSFER SPEED (SLOW, ERASE TIME IS NOT REDUCIBLE, CHECK OTHER CAUSES)
+    AUTOPOLLING OF ERASE = BLOCKING -> ADD INTERRUPTS
+	CODE TO CLEAN AND ORGANIZE. IMPROVE ROBUSTNESS (REQUEST SENSE, "HOT-UNPLUG", etc)
+	CHECK AND CREATE MORE FATfs USER FUNCTIONS ON ff_funct.c
 */
 
 #include <stdio.h>
-#include "stm32f469xx.h"
 #include "main.h"
+#include "timers.h"
+#include "uart3.h"
 #include "usb_msc_fs.h"
 #include "qspi.h"
 #include "myConfig.h"
-#include "timers.h"
 #include "diskio.h" 	// FatFs driver wrappers
 #include "ff_func.h" 	// a few homemade FATfs functions
-#include "uart3.h"
+
 
 uint32_t uid;
 uint8_t flag = 0;
@@ -62,7 +66,7 @@ int main (void)
 	BareM_StatusTypeDef Ut_s = Uart3_Init(&huart3, 115200); // Init UART3
 	while(Ut_s != Bare_OK);
 
-	uid = readID();
+	uid = MT25Q_readID();
 	if(uid != 0x18BA20) return -1; // don't start if the correct Flash ID isn't read
 	QSPI_EnableQuadMode(); // comment to stay on SPI extended (1-1-1)
 
@@ -100,7 +104,6 @@ void EXTI0_IRQHandler(void) {
 
         // 1. Button Pushed (Rising Edge for PA0 Discovery)
         if ((GPIOA->IDR & (1 << 0)) && pushed == 0) {
-
             pushed = 1;
             TicksMs = GetSysTick();
         }
@@ -109,8 +112,7 @@ void EXTI0_IRQHandler(void) {
             pushed = 0;
             GPIOG->ODR^=GPIO_ODR_OD6; // green
             uint32_t duration = GetSysTick() - TicksMs;
-
-            // Only trigger if it was a deliberate press (e.g., > 100ms)
+            // Only trigger if it was a deliberate press
             if (duration > 150) {
                 was_long_press = 1;
             }

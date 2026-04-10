@@ -7,7 +7,6 @@
 #define MSC_TOTAL_BLOCKS      (FLASH_TOTAL_SIZE / MSC_BLOCK_SIZE) // 4096
 
 
-
 void QSPI_Hardware_Init(void);
 
 void QSPI_Flash_Reset(void);
@@ -17,7 +16,7 @@ void QSPI_EnableQuadMode(void);
 uint8_t QSPI_GetStatus(uint8_t instruction);
 void QSPI_WaitUntilReady(void);
 void QSPI_Prepare_Indirect(void);
-uint32_t readID(void);
+uint32_t MT25Q_readID(void);
 
 void MT25Q_SubsectorRead(uint32_t address, uint8_t *rData);
 void MT25Q_SubsectorErase_4KB(uint32_t address);

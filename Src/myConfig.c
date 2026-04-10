@@ -1,4 +1,4 @@
-//#include "stm32f469xx.h"
+
 #include "stm32f4xx.h"
 #include <myConfig.h>
 
@@ -145,16 +145,6 @@ void InterruptGPIO_Config (void)
 	EXTI->FTSR |= (1<<0); // Enable Falling Edge Trigger for PA0  (PA0 is usually active High)
 	NVIC_SetPriority(EXTI0_IRQn, 10);
 	NVIC_EnableIRQ(EXTI0_IRQn);
-
-	//SYSCFG->EXTICR[1] &= ~(0xF<<8);  // Bits[8:9:10:] = (0:0:0:0) -> configure EXTI1 line for PA1; SYSCFG external interrupt configuration register 1 (SYSCFG_EXTICR1)
-	SYSCFG->EXTICR[3] &= ~(0xF<<0); // first, clear the  bits / EXTI12 is in EXTICR[3], bits [3:0] / SYSCFG external interrupt configuration register 3
-	SYSCFG->EXTICR[3] |= (1<<0); // Set Port B (0001); These bits are written by software to select the source input for the EXTIx	external interrupt
-	EXTI->IMR |= (1<<12);  // Bit[0] = 1  --> Disable the Mask on EXTI 1 (Interrupt mask register (EXTI_IMR))
-	EXTI->RTSR |= (1<<12);  //  interrupt when button released - Enable Rising Edge Trigger for PB12 (Rising trigger selection register (EXTI_RTSR))
-	EXTI->FTSR |= (1<<12); // Rotary encoder switch - interrupt when button pushed - - Enable Rising Edge Trigger
-	NVIC_SetPriority(EXTI15_10_IRQn, 9);
-	NVIC_EnableIRQ(EXTI15_10_IRQn);
-
 
 }
 
